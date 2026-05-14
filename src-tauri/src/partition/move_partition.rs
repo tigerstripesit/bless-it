@@ -408,7 +408,7 @@ async fn backup_partition_linux(
     Ok(true)
 }
 
-/// macOS-specific partition backup
+/// macOS-specific partition backup using rsync
 #[cfg(target_os = "macos")]
 async fn backup_partition_macos(
     partition: &PartitionInfo,
@@ -780,7 +780,7 @@ async fn restore_partition_macos(
     progress_callback: &impl Fn(MoveProgress),
 ) -> Result<bool> {
     use std::process::Command;
-    
+
     let mount_point = partition
         .mount_point
         .as_ref()
