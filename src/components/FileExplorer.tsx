@@ -74,12 +74,16 @@ const useStyles = makeStyles({
         display: 'flex',
         alignItems: 'center',
         ...shorthands.gap('8px'),
+        minWidth: 0,
     },
     pathBar: {
         display: 'flex',
         alignItems: 'center',
         ...shorthands.gap('10px'),
         flexGrow: 1,
+        flexShrink: 1,
+        minWidth: 0,
+        overflow: 'hidden',
     },
     gridContainer: {
         flexGrow: 1,

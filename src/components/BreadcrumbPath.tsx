@@ -21,18 +21,32 @@ const useStyles = makeStyles({
         alignItems: 'center',
         flexWrap: 'nowrap',
         overflowX: 'auto',
+        overflowY: 'hidden',
         backgroundColor: tokens.colorNeutralBackground1,
         ...shorthands.border('1px', 'solid', tokens.colorNeutralStroke1),
         ...shorthands.borderRadius('4px'),
         ...shorthands.padding('2px', '4px'),
-        minHeight: '32px',
+        height: '32px',
+        boxSizing: 'border-box',
         flexGrow: 1,
+        flexShrink: 1,
+        minWidth: 0,
+        // Invisible scrollbar — Firefox + WebKit
+        scrollbarWidth: 'none',
+        msOverflowStyle: 'none',
+        '::-webkit-scrollbar': {
+            display: 'none',
+            width: 0,
+            height: 0,
+        },
     },
     segmentButton: {
         minWidth: 'auto',
         paddingLeft: '4px',
         paddingRight: '4px',
         fontWeight: 'normal',
+        flexShrink: 0,
+        whiteSpace: 'nowrap',
         ':hover': {
             backgroundColor: tokens.colorNeutralBackground1Hover,
         }
@@ -41,6 +55,14 @@ const useStyles = makeStyles({
         color: tokens.colorNeutralForeground3,
         marginLeft: '2px',
         marginRight: '2px',
+        flexShrink: 0,
+    },
+    filler: {
+        flexGrow: 1,
+        flexShrink: 1,
+        alignSelf: 'stretch',
+        minWidth: 0,
+        cursor: 'text',
     },
 });
 
@@ -54,6 +76,7 @@ export const BreadcrumbPath = ({ path, onNavigate }: BreadcrumbPathProps) => {
     const [isEditing, setIsEditing] = React.useState(false);
     const [editValue, setEditValue] = React.useState(path);
     const inputRef = React.useRef<HTMLInputElement>(null);
+    const containerRef = React.useRef<HTMLDivElement>(null);
 
     React.useEffect(() => {
         setEditValue(path);
@@ -65,6 +88,14 @@ export const BreadcrumbPath = ({ path, onNavigate }: BreadcrumbPathProps) => {
             inputRef.current.focus();
         }
     }, [isEditing]);
+
+    // Keep the current folder (rightmost segment) in view when path changes
+    React.useLayoutEffect(() => {
+        const el = containerRef.current;
+        if (el && !isEditing) {
+            el.scrollLeft = el.scrollWidth;
+        }
+    }, [path, isEditing]);
 
     const handleSegmentClick = (index: number, segments: string[]) => {
         // Reconstruct path
@@ -109,7 +140,7 @@ export const BreadcrumbPath = ({ path, onNavigate }: BreadcrumbPathProps) => {
 
     if (isEditing) {
         return (
-            <div className={styles.container}>
+            <div className={styles.container} ref={containerRef}>
                 <Input
                     ref={inputRef}
                     value={editValue}
@@ -133,6 +164,7 @@ export const BreadcrumbPath = ({ path, onNavigate }: BreadcrumbPathProps) => {
     return (
         <div
             className={styles.container}
+            ref={containerRef}
             onClick={(e) => {
                 // If clicked on the container background (not a button), switch to edit
                 if (e.target === e.currentTarget) {
@@ -187,7 +219,7 @@ export const BreadcrumbPath = ({ path, onNavigate }: BreadcrumbPathProps) => {
             })}
 
             {/* Filler to take up space and allow clicking to edit */}
-            <div style={{ flexGrow: 1, alignSelf: 'stretch', cursor: 'text' }} onClick={() => setIsEditing(true)} />
+            <div className={styles.filler} onClick={() => setIsEditing(true)} />
         </div>
     );
 };
