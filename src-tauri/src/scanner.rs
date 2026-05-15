@@ -163,12 +163,13 @@ fn scan_subdir_details(
 
     if let Ok(read_dir) = std::fs::read_dir(path) {
         let entries: Vec<_> = read_dir.filter_map(|e| e.ok()).collect();
-        
+
         // Split into files/dirs
         let mut sub_files_size = 0;
         let mut sub_files_count = 0;
         let mut sub_dirs = Vec::new();
-        
+        let mut sub_files: Vec<(std::fs::DirEntry, std::fs::Metadata)> = Vec::new();
+
         for entry in entries {
             if let Some(c) = &cancel {
                  if c.load(Ordering::Relaxed) { return Err("Cancelled".to_string()); }
@@ -181,35 +182,37 @@ fn scan_subdir_details(
                     let s = meta.len();
                     sub_files_size += s;
                     sub_files_count += 1;
-                    
+
                     if let Some(st) = &stats {
                         st.scanned_files.fetch_add(1, Ordering::Relaxed);
                         st.total_size.fetch_add(s, Ordering::Relaxed);
                     }
+
+                    sub_files.push((entry, meta));
                 }
              }
         }
-        
+
         total_size += sub_files_size;
         total_count += sub_files_count;
-        
+
         // Process these subdirectories (Deep scan for size)
         let sub_dir_nodes_res: Result<Vec<FileNode>, String> = sub_dirs.par_iter().map(|entry| {
              if let Some(c) = &cancel {
                  if c.load(Ordering::Relaxed) { return Err("Cancelled".to_string()); }
              }
-             
+
              let p = entry.path();
              let name = entry.file_name().to_string_lossy().to_string();
              let p_str = p.to_string_lossy().to_string();
-             
+
              // Get stats using walkdir (Deep scan)
              let (s, c) = get_deep_stats(&p, stats.clone(), cancel.clone())?;
-             
+
              let m = entry.metadata().ok().and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs()).unwrap_or(0);
-                
+
              Ok(FileNode {
                  name,
                  path: p_str,
@@ -222,16 +225,39 @@ fn scan_subdir_details(
         }).collect();
 
         let sub_dir_nodes = sub_dir_nodes_res?;
-        
+
         for node in &sub_dir_nodes {
             total_size += node.size;
             total_count += node.file_count;
         }
-        
+
         children_nodes = sub_dir_nodes;
+
+        // Include file children so the cached lookahead matches a direct scan.
+        // Without this, navigating into a leaf folder (files only) returns
+        // an empty list until the user hits refresh.
+        let file_nodes: Vec<FileNode> = sub_files.iter().map(|(entry, meta)| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let p_str = entry.path().to_string_lossy().to_string();
+            let m = meta.modified().ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            FileNode {
+                name,
+                path: p_str,
+                size: meta.len(),
+                is_dir: false,
+                children: None,
+                last_modified: m,
+                file_count: 1,
+            }
+        }).collect();
+        children_nodes.extend(file_nodes);
+
         children_nodes.sort_by(|a, b| b.size.cmp(&a.size));
     }
-    
+
     Ok((total_size, total_count, children_nodes))
 }
 
