@@ -335,13 +335,12 @@ export const FileExplorer = ({ onToggleAI, isAIPanelOpen, onContextChange }: Fil
     const [deleteDialogOpen, setDeleteDialogOpen] = React.useState(false);
     const [propertiesDialogOpen, setPropertiesDialogOpen] = React.useState(false);
     const [dialogItem, setDialogItem] = React.useState<FileNode | null>(null);
+    const [dialogItems, setDialogItems] = React.useState<FileNode[] | null>(null);
 
-    // Compute the actually selected item object (only one supported for now)
-    const selectedItem = React.useMemo(() => {
-        if (selectedItems.size === 0) return null;
-        const id = Array.from(selectedItems)[0];
-        // We use path as ID
-        return state.data?.children?.find(c => c.path === id) || null;
+    // Compute all selected item objects (multi-select)
+    const selectedItemsList = React.useMemo(() => {
+        if (selectedItems.size === 0) return [];
+        return state.data?.children?.filter(c => selectedItems.has(c.path)) || [];
     }, [selectedItems, state.data]);
 
     const formatSize = (bytes: number): string => {
@@ -564,18 +563,16 @@ export const FileExplorer = ({ onToggleAI, isAIPanelOpen, onContextChange }: Fil
         }
     };
 
-    const handleDeleteClick = (item: FileNode) => {
-        setDialogItem(item);
-        setDeleteDialogOpen(true);
-    };
-
     const confirmDelete = async () => {
-        if (!dialogItem) return;
+        const items = dialogItems;
+        if (!items || items.length === 0) return;
         try {
-            await invoke('delete_item', { path: dialogItem.path });
+            for (const item of items) {
+                await invoke('delete_item', { path: item.path });
+            }
             fetchData(state.path, true);
             setDeleteDialogOpen(false);
-            setDialogItem(null);
+            setDialogItems(null);
         } catch (e) {
             console.error(`Failed to delete: ${e}`);
             alert(`Failed to delete: ${e}`);
@@ -636,8 +633,8 @@ export const FileExplorer = ({ onToggleAI, isAIPanelOpen, onContextChange }: Fil
                 <Tooltip content="Open Selected Folder" relationship="label">
                     <Button
                         icon={<ArrowRightRegular />}
-                        disabled={!selectedItem || !selectedItem.is_dir}
-                        onClick={() => selectedItem && handleNavigate(selectedItem.path)}
+                        disabled={selectedItemsList.length !== 1 || !selectedItemsList[0]?.is_dir}
+                        onClick={() => selectedItemsList[0] && handleNavigate(selectedItemsList[0].path)}
                     />
                 </Tooltip>
                 {/* <Tooltip content="Up" relationship="label">
@@ -715,7 +712,7 @@ export const FileExplorer = ({ onToggleAI, isAIPanelOpen, onContextChange }: Fil
                                 items={items}
                                 columns={columns}
                                 sortable
-                                selectionMode="single"
+                                selectionMode="multiselect"
                                 selectedItems={selectedItems}
                                 onSelectionChange={(e, data) => setSelectedItems(data.selectedItems)}
                                 getRowId={(item) => item.path}
@@ -736,7 +733,10 @@ export const FileExplorer = ({ onToggleAI, isAIPanelOpen, onContextChange }: Fil
                                                 setContextMenuItem(item);
                                                 setContextMenuLocation({ x: e.clientX, y: e.clientY });
                                                 setContextMenuOpen(true);
-                                                setSelectedItems(new Set([item.path])); // Auto select on right click
+                                                // If item not already selected, select only this one
+                                                if (!selectedItems.has(item.path)) {
+                                                    setSelectedItems(new Set([item.path]));
+                                                }
                                             }}
                                             onDoubleClick={() => handleOpenFile(item)}
                                             onKeyDown={(e: React.KeyboardEvent) => {
@@ -775,17 +775,35 @@ export const FileExplorer = ({ onToggleAI, isAIPanelOpen, onContextChange }: Fil
                             >
                                 <MenuPopover>
                                     <MenuList>
-                                        <MenuItem icon={<OpenRegular />} onClick={() => contextMenuItem && handleOpenFile(contextMenuItem)}>
+                                        <MenuItem
+                                            icon={<OpenRegular />}
+                                            onClick={() => contextMenuItem && handleOpenFile(contextMenuItem)}
+                                            disabled={selectedItemsList.length !== 1}
+                                        >
                                             Open
                                         </MenuItem>
                                         <MenuItem icon={<FolderOpenRegular />} onClick={() => contextMenuItem && handleRevealInExplorer(contextMenuItem)}>
                                             Reveal in Explorer/Finder
                                         </MenuItem>
-                                        <MenuItem icon={<InfoRegular />} onClick={() => contextMenuItem && handlePropertiesClick(contextMenuItem)} disabled={!contextMenuItem}>
+                                        <MenuItem
+                                            icon={<InfoRegular />}
+                                            onClick={() => contextMenuItem && handlePropertiesClick(contextMenuItem)}
+                                            disabled={selectedItemsList.length !== 1}
+                                        >
                                             Properties
                                         </MenuItem>
-                                        <MenuItem icon={<DeleteRegular />} onClick={() => contextMenuItem && handleDeleteClick(contextMenuItem)}>
-                                            Delete
+                                        <MenuItem icon={<DeleteRegular />} onClick={() => {
+                                            if (selectedItemsList.length > 1) {
+                                                setDialogItems(selectedItemsList);
+                                            } else if (contextMenuItem) {
+                                                setDialogItems([contextMenuItem]);
+                                            }
+                                            setDeleteDialogOpen(true);
+                                        }}>
+                                            {selectedItemsList.length > 1
+                                                ? `Delete ${selectedItemsList.length} items`
+                                                : 'Delete'
+                                            }
                                         </MenuItem>
                                     </MenuList>
                                 </MenuPopover>
@@ -834,22 +852,38 @@ export const FileExplorer = ({ onToggleAI, isAIPanelOpen, onContextChange }: Fil
                             </Dialog>
 
                             {/* Delete Confirmation Dialog */}
-                            <Dialog open={deleteDialogOpen} onOpenChange={(event, data) => setDeleteDialogOpen(data.open)}>
+                            <Dialog open={deleteDialogOpen} onOpenChange={(event, data) => {
+                                setDeleteDialogOpen(data.open);
+                                if (!data.open) setDialogItems(null);
+                            }}>
                                 <DialogSurface>
                                     <DialogBody>
                                         <DialogTitle>Confirm Delete</DialogTitle>
                                         <DialogContent>
-                                            <Text>
-                                                Are you sure you want to permanently delete <strong>{dialogItem?.name}</strong>?
-                                            </Text>
-                                            {dialogItem?.is_dir && (
-                                                <Text block style={{ marginTop: '10px', color: 'var(--colorPaletteRedForeground1)' }}>
-                                                    Warning: This is a folder. All contents will be deleted.
-                                                </Text>
+                                            {dialogItems && dialogItems.length === 1 ? (
+                                                <>
+                                                    <Text>
+                                                        Are you sure you want to permanently delete <strong>{dialogItems[0].name}</strong>?
+                                                    </Text>
+                                                    {dialogItems[0].is_dir && (
+                                                        <Text block style={{ marginTop: '10px', color: 'var(--colorPaletteRedForeground1)' }}>
+                                                            Warning: This is a folder. All contents will be deleted.
+                                                        </Text>
+                                                    )}
+                                                </>
+                                            ) : (
+                                                <>
+                                                    <Text>
+                                                        Are you sure you want to permanently delete <strong>{dialogItems?.length}</strong> items?
+                                                    </Text>
+                                                    <Text block style={{ marginTop: '10px', color: 'var(--colorPaletteRedForeground1)' }}>
+                                                        Warning: This action cannot be undone.
+                                                    </Text>
+                                                </>
                                             )}
                                         </DialogContent>
                                         <DialogActions>
-                                            <Button appearance="secondary" onClick={() => setDeleteDialogOpen(false)}>Cancel</Button>
+                                            <Button appearance="secondary" onClick={() => { setDeleteDialogOpen(false); setDialogItems(null); }}>Cancel</Button>
                                             <Button appearance="primary" style={{ backgroundColor: '#d13438', color: 'white' }} onClick={confirmDelete}>Delete</Button>
                                         </DialogActions>
                                     </DialogBody>
@@ -869,7 +903,22 @@ export const FileExplorer = ({ onToggleAI, isAIPanelOpen, onContextChange }: Fil
 
             {/* Status Bar */}
             <div className={styles.statusBar}>
-                <Text>{items.length} items</Text>
+                <div style={{ display: 'flex', gap: '16px', alignItems: 'center' }}>
+                    <Text>{items.length} items</Text>
+                    {selectedItems.size > 0 && (
+                        <>
+                            <div style={{ width: '1px', height: '14px', background: tokens.colorNeutralStroke2 }} />
+                            <Text weight="semibold">{selectedItems.size} selected</Text>
+                            <Button
+                                appearance="subtle"
+                                size="small"
+                                onClick={() => setSelectedItems(new Set())}
+                            >
+                                Clear
+                            </Button>
+                        </>
+                    )}
+                </div>
                 <Text>Total Size: {formatSize(state.data?.size || 0)}</Text>
             </div>
         </div>
