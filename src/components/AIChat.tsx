@@ -68,7 +68,7 @@ const useStyles = makeStyles({
         color: tokens.colorNeutralForeground1,
     },
     messageContent: {
-        maxWidth: '70%',
+        maxWidth: '85%',
         minWidth: 0,
         display: 'flex',
         flexDirection: 'column',
