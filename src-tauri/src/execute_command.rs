@@ -10,6 +10,8 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
+use crate::shell_classify;
+
 const MAX_OUTPUT_CHARS: usize = 10_000;
 // Default chosen empirically: `du -sh /*` from root on macOS routinely exceeds
 // 30s once /System and /Users are traversed, and the model has no good way to
@@ -18,46 +20,12 @@ const MAX_OUTPUT_CHARS: usize = 10_000;
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 300;
 
-static BLOCKED_PATTERNS: &[&str] = &[
-    "rm -rf /",
-    "rm -rf /*",
-    "rm -rf --no-preserve-root",
-    "dd if=",
-    "mkfs.",
-    "mkfs ",
-    "fdisk",
-    "parted",
-    "mke2fs",
-    "mkswap",
-    "format ",
-    ":(){",
-    ":() {",
-    "shutdown",
-    "reboot",
-    "halt",
-    "poweroff",
-    "init 0",
-    "init 6",
-    "sudo ",
-    "su ",
-    "doas ",
-    "chmod 777 /",
-    "chmod -R 777 /",
-    "iptables -F",
-    "ufw disable",
-];
-
 #[derive(Debug, Serialize)]
 pub struct ExecuteCommandResponse {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
     pub timed_out: bool,
-}
-
-fn is_blocked(cmd: &str) -> bool {
-    let lower = cmd.to_lowercase();
-    BLOCKED_PATTERNS.iter().any(|p| lower.contains(p))
 }
 
 fn sanitize_output(s: &str) -> String {
@@ -82,7 +50,7 @@ pub async fn execute_command(
         return Err("Command cannot be empty".to_string());
     }
 
-    if is_blocked(&cmd) {
+    if shell_classify::is_blocked(&cmd) {
         warn!("Blocked dangerous command: {}", cmd);
         return Err("Command blocked for security reasons".to_string());
     }

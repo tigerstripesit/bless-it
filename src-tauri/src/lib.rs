@@ -4,6 +4,7 @@ mod ai;
 mod ai_commands;
 mod cleaner;
 mod execute_command;
+mod shell_classify;
 mod system_tools;
 mod partition;
 mod partition_commands;

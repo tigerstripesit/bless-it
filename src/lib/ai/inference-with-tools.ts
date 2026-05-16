@@ -3,6 +3,7 @@ import { InferenceRequest, InferenceResponse, ChatMessage, MessageRole, ToolExec
 import { runInference } from './ai-service';
 import { detectToolCall, extractToolCalls, formatToolResult, removeToolCallTags } from './tool-calling';
 import { runtimeSettings } from '@/lib/runtimeSettings';
+import { classifyShellCommand } from './shell-classify';
 
 export interface ToolExecutionEvent {
     /** Unique per call within a turn. The model can invoke the same tool
@@ -31,37 +32,12 @@ export interface InferenceWithToolsOptions {
     isCancelled?: () => boolean;
 }
 
-// Commands that mutate the filesystem — confirm before running.
-const WRITE_PATTERNS: RegExp[] = [
-    /^\s*rm(\s|$)/,
-    /^\s*mv(\s|$)/,
-    /^\s*cp(\s|$)/,
-    /^\s*dd(\s|$)/,
-    /(^|[;&|]\s*)>\s*\S/,    // redirect to file (write/truncate)
-    /(^|[;&|]\s*)>>\s*\S/,   // append redirect
-];
-
-// Commands that read file contents — confirm to protect the user's privacy
-// (the model will see the file body otherwise). Directory-listing and metadata
-// commands (ls, find, du, stat, file) are NOT gated; only commands that dump
-// contents into the agent's context are.
-const READ_PATTERNS: RegExp[] = [
-    /^\s*cat(\s|$)/,
-    /^\s*less(\s|$)/,
-    /^\s*more(\s|$)/,
-    /^\s*head(\s|$)/,
-    /^\s*tail(\s|$)/,
-    /^\s*bat(\s|$)/,
-    /^\s*od(\s|$)/,
-    /^\s*xxd(\s|$)/,
-    /^\s*strings(\s|$)/,
-];
-
-function classifyCommand(cmd: string): ConfirmKind | null {
-    if (WRITE_PATTERNS.some((p) => p.test(cmd))) return 'write';
-    if (READ_PATTERNS.some((p) => p.test(cmd))) return 'read';
-    return null;
-}
+// Classification of which shell commands need a confirmation prompt is
+// delegated to ./shell-classify. That module tokenizes the command and
+// resolves wrappers (sudo/env/timeout/sh -c/find -exec/xargs/eval/$(…))
+// so that e.g. `find … -exec rm -rf {} +` is correctly identified as a
+// write — prefix matching on `^rm` does not catch that.
+const classifyCommand = classifyShellCommand;
 
 interface ExecuteCommandResponse {
     stdout: string;
