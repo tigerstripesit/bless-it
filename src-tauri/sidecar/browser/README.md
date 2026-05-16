@@ -35,7 +35,7 @@ Event (sidecar → host, `id` omitted/null):
 
 `browser.act` and `browser.extract` arrive in M2/M3.
 
-## Running locally
+## Running locally (dev)
 
 ```bash
 npm install
@@ -43,5 +43,36 @@ npm run install-chromium
 npm run dev    # interactive: type JSON-RPC frames on stdin, one per line
 ```
 
-For production builds the sidecar is bundled as a Tauri `externalBin` —
-that packaging step is M1.x follow-up work; see `tauri.conf.json`.
+`cargo run` / `npm run tauri dev` will spawn `node dist/index.js` automatically — no further packaging required.
+
+## Production build
+
+```bash
+npm install
+npm run install-chromium
+npm run package        # → ../../binaries/ittoolkit-browser-<host-triple>(.exe)
+```
+
+The packager (`scripts/build-sidecar.mjs`) does:
+
+1. esbuild bundle → `dist/bundle.cjs` (Playwright kept external).
+2. Node SEA blob (`node --experimental-sea-config`) → `dist/sea-prep.blob`.
+3. Copy `process.execPath` and `postject` the blob into it.
+4. macOS: strip + ad-hoc re-sign so dyld will load the modified binary.
+
+After the binary exists, add this entry to `src-tauri/tauri.conf.json`
+inside `bundle` before running `cargo tauri build`:
+
+```jsonc
+"externalBin": ["binaries/ittoolkit-browser"]
+```
+
+(Tauri suffixes the target triple itself — `…-aarch64-apple-darwin`,
+`…-x86_64-pc-windows-msvc.exe`, etc.) We intentionally keep that line out
+of the committed `tauri.conf.json` because `cargo check` fails when an
+`externalBin` entry points at a missing file, which would break local
+development for anyone who hasn't run the packager yet.
+
+`BrowserSupervisor` (in `src-tauri/src/browser_commands.rs`) tries the
+packaged binary first at runtime, then falls back to `node dist/index.js`,
+so the same Rust code path works in both modes.

@@ -35,6 +35,15 @@ interface FlagDescriptor {
     description: string;
 }
 
+const BROWSER_FLAGS: FlagDescriptor[] = [
+    {
+        key: 'browserAgent',
+        label: 'Browser-use harness',
+        description:
+            'Let the agent drive a real Chromium browser via a Playwright sidecar — open, navigate, observe, click/type with risk-tiered approval, extract structured data, and replay recorded workflows. Requires a vision-capable model (mark the active saved provider as Supports vision). Adds a Browser and Workflows pane to the main workspace.',
+    },
+];
+
 const MEMORY_FLAGS: FlagDescriptor[] = [
     {
         key: 'memorySlidingWindow',
@@ -223,6 +232,36 @@ export const MemorySettingsSection: React.FC = () => {
     return (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
             <AgentSection />
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <div>
+                    <Text weight="semibold" size={400}>
+                        Browser &amp; Workflows
+                    </Text>
+                    <Text
+                        size={200}
+                        block
+                        style={{ color: tokens.colorNeutralForeground3, marginTop: '4px' }}
+                    >
+                        Web-driving capabilities. When enabled the agent can run Playwright actions
+                        against admin consoles, KB pages, and status sites. Off by default — turn it
+                        on alongside a vision-capable saved provider.
+                    </Text>
+                </div>
+                <Divider style={{ margin: '8px 0' }} />
+                {BROWSER_FLAGS.map((flag) => (
+                    <React.Fragment key={flag.key}>
+                        <FlagRow
+                            descriptor={flag}
+                            onToggle={handleToggle}
+                            onReset={handleReset}
+                            value={featureFlags[flag.key]}
+                            overridden={isFeatureFlagOverridden(flag.key)}
+                        />
+                        <Divider />
+                    </React.Fragment>
+                ))}
+            </div>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                 <div>

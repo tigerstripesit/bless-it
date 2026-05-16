@@ -730,8 +730,34 @@ export const AIPanel = ({
                 userVisibleContent = invocation.args
                     ? `/${invocation.name} ${invocation.args}`
                     : `/${invocation.name}`;
+
+                // Push the skill's declared browser capabilities into the
+                // Rust-side gate. When the skill omits `capabilities:`
+                // (empty list), this falls back to chat-default permissions.
+                const manifest = skillsRef.current.find((s) => s.name === invocation.name);
+                const browserPatterns = (manifest?.capabilities ?? [])
+                    .filter((c) => c.startsWith('browser:') && c !== 'browser:screenshot');
+                const allowScreenshot = (manifest?.capabilities ?? []).includes('browser:screenshot') || true;
+                try {
+                    await invoke('browser_set_capabilities', {
+                        skillId: invocation.name,
+                        patterns: browserPatterns,
+                        allowScreenshot,
+                    });
+                } catch (capErr) {
+                    console.warn('[AIPanel] Failed to set browser capabilities for skill:', capErr);
+                }
             } catch (err) {
                 console.warn('[AIPanel] Failed to load skill body:', err);
+            }
+        } else {
+            // No skill invoked — clear any prior skill-scoped capabilities so
+            // unrestricted chat doesn't accidentally inherit the last skill's
+            // narrower allowlist.
+            try {
+                await invoke('browser_clear_capabilities');
+            } catch (capErr) {
+                console.warn('[AIPanel] Failed to clear browser capabilities:', capErr);
             }
         }
 

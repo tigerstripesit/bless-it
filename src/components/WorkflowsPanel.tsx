@@ -24,6 +24,7 @@ import {
     Spinner,
 } from '@fluentui/react-components';
 import { Warning20Regular, Record16Regular, Stop16Regular, Play16Regular, Delete16Regular } from '@fluentui/react-icons';
+import { WorkflowReplayDialog } from './WorkflowReplayDialog';
 
 interface WorkflowSummary {
     name: string;
@@ -104,6 +105,7 @@ export function WorkflowsPanel() {
     const [name, setName] = useState('');
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [replaying, setReplaying] = useState<{ slug: string; name: string } | null>(null);
 
     const refresh = useCallback(async () => {
         try {
@@ -243,8 +245,8 @@ export function WorkflowsPanel() {
                             <Button
                                 appearance="subtle"
                                 icon={<Play16Regular />}
-                                disabled
-                                title="Replay UI lands in a follow-up; for now ask the agent to replay this workflow from chat."
+                                onClick={() => setReplaying({ slug: wf.slug, name: wf.name })}
+                                disabled={loading}
                             >
                                 Replay
                             </Button>
@@ -258,6 +260,13 @@ export function WorkflowsPanel() {
                     ))
                 )}
             </div>
+            {replaying && (
+                <WorkflowReplayDialog
+                    slug={replaying.slug}
+                    name={replaying.name}
+                    onClose={() => setReplaying(null)}
+                />
+            )}
         </div>
     );
 }

@@ -225,6 +225,7 @@ interface FormState {
     modelName: string;
     isDefault: boolean;
     contextWindow?: number;
+    supportsVision: boolean;
 }
 
 const emptyForm: FormState = {
@@ -234,6 +235,7 @@ const emptyForm: FormState = {
     modelName: '',
     isDefault: false,
     contextWindow: undefined,
+    supportsVision: false,
 };
 
 export function SavedProvidersPanel({ onChange, onEditingStateChange }: SavedProvidersPanelProps) {
@@ -281,6 +283,7 @@ export function SavedProvidersPanel({ onChange, onEditingStateChange }: SavedPro
             modelName: p.modelName,
             isDefault: p.isDefault,
             contextWindow: p.contextWindow,
+            supportsVision: !!p.supportsVision,
         });
     };
 
@@ -366,6 +369,7 @@ export function SavedProvidersPanel({ onChange, onEditingStateChange }: SavedPro
             modelName: editing.modelName,
             isDefault: editing.isDefault,
             contextWindow: editing.contextWindow,
+            supportsVision: editing.supportsVision,
         });
         if (!getActiveProviderId()) {
             setActiveProviderId(saved.id);
@@ -470,6 +474,21 @@ export function SavedProvidersPanel({ onChange, onEditingStateChange }: SavedPro
                         />
                         Use as default on app start
                     </Label>
+
+                    <div>
+                        <Label>
+                            <input
+                                type="checkbox"
+                                checked={editing.supportsVision}
+                                onChange={(e) => setEditing({ ...editing, supportsVision: e.target.checked })}
+                                style={{ marginRight: '8px' }}
+                            />
+                            Model supports vision (image inputs)
+                        </Label>
+                        <Text size={200} style={{ display: 'block', color: tokens.colorNeutralForeground3, marginLeft: '24px' }}>
+                            Required for the browser-use harness — without it, browser tools stay hidden from the agent. Examples: Claude Sonnet 4.6 / Opus 4.7, GPT-4o, Qwen2.5-VL.
+                        </Text>
+                    </div>
                 </div>
 
                 {testResult && (

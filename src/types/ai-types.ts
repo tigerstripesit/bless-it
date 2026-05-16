@@ -528,6 +528,14 @@ export interface SkillManifest {
     hasShellInjection: boolean;
     enabled: boolean;
     trusted: boolean;
+    /** Capability strings declared in SKILL.md frontmatter. Recognized today:
+     *  `browser:<url-glob>` (e.g. `browser:https://*.okta.com/*`) and
+     *  `browser:screenshot`. Empty when the skill didn't declare any. */
+    capabilities?: string[];
+    /** "ephemeral" | "persistent" — browser profile preference declared
+     *  by the skill. Used as the default profile in browser_open calls
+     *  while this skill is active. */
+    profile?: string;
 }
 
 /**

@@ -117,6 +117,18 @@ struct RawSkillFrontmatter {
     arguments: Option<serde_yaml::Value>,
     #[serde(default, rename = "argument-hint")]
     argument_hint: Option<String>,
+    /// Optional list of capability strings the skill needs to function.
+    /// Recognized namespaces today: `browser:<glob>`, `browser:screenshot`.
+    /// Future: `fs:`, `shell:` — the loader stays permissive about unknowns
+    /// so the format can grow without breaking older skills.
+    #[serde(default)]
+    capabilities: Option<serde_yaml::Value>,
+    /// Browser profile: "ephemeral" (default — fresh Chromium each time) or
+    /// "persistent" (reuse cookies / SSO across runs). Surfaced to the
+    /// frontend so `browser_open` calls inside this skill can pass it
+    /// through automatically.
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -134,6 +146,14 @@ pub struct SkillManifest {
     pub has_shell_injection: bool,
     pub enabled: bool,
     pub trusted: bool,
+    /// Capability strings declared in frontmatter (browser:* etc.).
+    /// Empty when the skill omits the field — chat-default permissions apply.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// "ephemeral" | "persistent". None means the skill didn't declare a
+    /// preference; browser_open defaults to ephemeral.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 fn yaml_value_to_string_list(v: &serde_yaml::Value) -> Vec<String> {
@@ -195,6 +215,14 @@ fn build_manifest(dir: &Path, fm: RawSkillFrontmatter, body: &str, state: &Skill
     });
     let allowed_tools = fm.allowed_tools.as_ref().map(yaml_value_to_string_list).unwrap_or_default();
     let arguments = fm.arguments.as_ref().map(yaml_value_to_string_list).unwrap_or_default();
+    let capabilities = fm.capabilities.as_ref().map(yaml_value_to_string_list).unwrap_or_default();
+    let profile = fm.profile.and_then(|p| {
+        let trimmed = p.trim().to_lowercase();
+        match trimmed.as_str() {
+            "ephemeral" | "persistent" => Some(trimmed),
+            _ => None,
+        }
+    });
     SkillManifest {
         name,
         description,
@@ -208,6 +236,8 @@ fn build_manifest(dir: &Path, fm: RawSkillFrontmatter, body: &str, state: &Skill
         has_shell_injection: detect_shell_injection(body),
         enabled: state.enabled,
         trusted: state.trusted,
+        capabilities,
+        profile,
     }
 }
 

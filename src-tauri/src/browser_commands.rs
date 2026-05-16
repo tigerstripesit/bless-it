@@ -27,8 +27,19 @@ use tokio::sync::{oneshot, Mutex};
 
 const SIDECAR_REL_DEV: &str = "sidecar/browser/dist/index.js";
 const SIDECAR_REL_DEV_TS: &str = "sidecar/browser/src/index.ts";
+/// Name of the bundled sidecar binary (no extension; .exe added on Windows).
+const SIDECAR_BIN_NAME: &str = "ittoolkit-browser";
 const RPC_TIMEOUT_SECS: u64 = 45;
 const FRAME_EVENT: &str = "browser-frame";
+
+/// Source of the sidecar entry — bundled binary (packaged build) or a Node
+/// script (dev). Determines whether we exec the entry directly or wrap it
+/// with `node` / `npx tsx`.
+enum SidecarEntry {
+    BundledBinary(PathBuf),
+    NodeScript(PathBuf),
+    TsxScript(PathBuf),
+}
 
 /// Pending RPC waiting on its response. Keyed by the JSON-RPC id we sent.
 type PendingMap = HashMap<u64, oneshot::Sender<Result<Value, String>>>;
@@ -54,38 +65,78 @@ pub struct BrowserRpcRequest {
     pub params: Value,
 }
 
-/// Best-effort resolution of the sidecar entry point. In dev we run the
-/// pre-built JS from the Tauri working directory (src-tauri/); production
-/// packaging via Tauri externalBin is M1.x follow-up work.
-fn resolve_sidecar_entry() -> Result<PathBuf> {
-    // First try compiled JS.
+/// Resolve the sidecar entry, preferring the bundled binary (production
+/// build, externalBin) over Node-based dev paths.
+///
+/// Search order:
+///   1. `<app_dir>/ittoolkit-browser(.exe)` — Tauri externalBin layout next to the app binary.
+///   2. `<app_dir>/../Resources/ittoolkit-browser` — macOS app bundle Resources dir.
+///   3. `<cwd>/sidecar/browser/dist/index.js` — dev (compiled).
+///   4. `<cwd>/sidecar/browser/src/index.ts` — dev (source via tsx).
+fn resolve_sidecar_entry(app: &AppHandle) -> Result<SidecarEntry> {
+    use tauri::Manager;
+
+    let bin_name = if cfg!(windows) {
+        format!("{}.exe", SIDECAR_BIN_NAME)
+    } else {
+        SIDECAR_BIN_NAME.to_string()
+    };
+
+    // 1) Same dir as the main app binary (Tauri externalBin layout).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join(&bin_name);
+            if candidate.exists() {
+                return Ok(SidecarEntry::BundledBinary(candidate));
+            }
+            // 2) macOS app bundle Resources dir.
+            if cfg!(target_os = "macos") {
+                let resources = parent.join("..").join("Resources").join(&bin_name);
+                if resources.exists() {
+                    return Ok(SidecarEntry::BundledBinary(resources));
+                }
+            }
+        }
+    }
+
+    // Try Tauri's resource directory next (covers Tauri 2 packaging layouts).
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let candidate = resource_dir.join(&bin_name);
+        if candidate.exists() {
+            return Ok(SidecarEntry::BundledBinary(candidate));
+        }
+    }
+
+    // 3) Dev: compiled JS.
     let js = std::env::current_dir()?.join(SIDECAR_REL_DEV);
     if js.exists() {
-        return Ok(js);
+        return Ok(SidecarEntry::NodeScript(js));
     }
-    // Fall back to source via tsx (requires devDependency to be installed).
+    // 4) Dev: source via tsx.
     let ts = std::env::current_dir()?.join(SIDECAR_REL_DEV_TS);
     if ts.exists() {
-        return Ok(ts);
+        return Ok(SidecarEntry::TsxScript(ts));
     }
+
     Err(anyhow!(
-        "browser sidecar not found at {} or {} — run `npm install && npm run build` in src-tauri/sidecar/browser",
-        SIDECAR_REL_DEV,
-        SIDECAR_REL_DEV_TS
+        "browser sidecar not found. For production: place `{}` next to the app binary (build via `npm run package` in src-tauri/sidecar/browser). For dev: run `npm install && npm run build` in src-tauri/sidecar/browser.",
+        bin_name
     ))
 }
 
-fn build_command(entry: &PathBuf) -> Result<Command> {
-    let is_ts = entry.extension().and_then(|e| e.to_str()) == Some("ts");
-    let mut cmd = if is_ts {
-        // npx tsx <entry>
-        let mut c = Command::new("npx");
-        c.args(["tsx", entry.to_string_lossy().as_ref()]);
-        c
-    } else {
-        let mut c = Command::new("node");
-        c.arg(entry);
-        c
+fn build_command(entry: &SidecarEntry) -> Result<Command> {
+    let mut cmd = match entry {
+        SidecarEntry::BundledBinary(path) => Command::new(path),
+        SidecarEntry::NodeScript(path) => {
+            let mut c = Command::new("node");
+            c.arg(path);
+            c
+        }
+        SidecarEntry::TsxScript(path) => {
+            let mut c = Command::new("npx");
+            c.args(["tsx", path.to_string_lossy().as_ref()]);
+            c
+        }
     };
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.kill_on_drop(true);
@@ -103,12 +154,15 @@ async fn ensure_spawned(
         }
     }
 
-    let entry = resolve_sidecar_entry().map_err(|e| e.to_string())?;
-    log::info!("spawning browser sidecar: {}", entry.display());
+    let entry = resolve_sidecar_entry(app).map_err(|e| e.to_string())?;
+    let entry_display: PathBuf = match &entry {
+        SidecarEntry::BundledBinary(p) | SidecarEntry::NodeScript(p) | SidecarEntry::TsxScript(p) => p.clone(),
+    };
+    log::info!("spawning browser sidecar: {}", entry_display.display());
 
     let mut cmd = build_command(&entry).map_err(|e| e.to_string())?;
     let mut child = cmd.spawn().map_err(|e| {
-        format!("failed to spawn browser sidecar ({}): {}", entry.display(), e)
+        format!("failed to spawn browser sidecar ({}): {}", entry_display.display(), e)
     })?;
 
     let stdin = child.stdin.take().ok_or_else(|| "sidecar stdin missing".to_string())?;
