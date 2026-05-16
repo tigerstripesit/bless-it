@@ -13,6 +13,7 @@ mod skills;
 mod user_info;
 mod user_profile;
 mod audit_log;
+mod browser_capability;
 mod browser_classify;
 mod browser_commands;
 mod workflow_recorder;
@@ -36,6 +37,7 @@ pub fn run() {
     .manage(ai_commands::InferenceState::default())
     .manage(browser_commands::BrowserSupervisor::default())
     .manage(workflow_recorder::WorkflowRecorder::default())
+    .manage(browser_capability::BrowserCapabilityState::default())
     .invoke_handler(tauri::generate_handler![
         commands::scan_dir,
         commands::refresh_scan,
@@ -119,7 +121,11 @@ pub fn run() {
         workflow_recorder::workflow_list,
         workflow_recorder::workflow_load,
         workflow_recorder::workflow_delete,
-        workflow_recorder::workflow_replay_bind
+        workflow_recorder::workflow_replay_bind,
+        // Browser capability gate (M5: per-skill URL allowlist)
+        browser_capability::browser_set_capabilities,
+        browser_capability::browser_clear_capabilities,
+        browser_capability::browser_get_capabilities
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

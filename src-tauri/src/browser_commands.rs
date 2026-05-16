@@ -245,6 +245,7 @@ pub async fn browser_rpc(
     request: BrowserRpcRequest,
     state: State<'_, BrowserSupervisor>,
     recorder: State<'_, crate::workflow_recorder::WorkflowRecorder>,
+    capabilities: State<'_, crate::browser_capability::BrowserCapabilityState>,
 ) -> Result<Value, String> {
     // Authoritative classification for audit + future approval-token gating.
     // The frontend already gates write/destructive actions via the
@@ -258,6 +259,17 @@ pub async fn browser_rpc(
         request.method,
         risk.as_str()
     );
+
+    // Capability gate: if a skill is active and declares an allowed URL set,
+    // refuse navigate/act calls to URLs outside that set. When no skill is
+    // active, this is a no-op (chat default).
+    if request.method == "browser.navigate" || request.method == "browser.act" {
+        let caps_snapshot = capabilities.handle().read().await.clone();
+        let url = request.params.get("url").and_then(|v| v.as_str());
+        if let Some(url) = url {
+            crate::browser_capability::check_url(&caps_snapshot, url)?;
+        }
+    }
 
     let inner = Arc::clone(&state.inner);
     ensure_spawned(Arc::clone(&inner), &app).await?;
