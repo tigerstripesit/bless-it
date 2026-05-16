@@ -243,6 +243,22 @@ export const AIPanel = ({
     } | null>(null);
     const rejectConfirmRef = useRef<(() => void) | null>(null);
 
+    // Map of inline confirm_action cards waiting for user response. Populated
+    // when the agent emits an agent_action(confirm_action); read when the user
+    // clicks Execute or Dismiss. The suggestedCommand is captured at emit time
+    // so the app runs the SAME command the model proposed — not whatever the
+    // model recalls later. This closes the replay-attack vector where a
+    // post-confirmation message could nudge the model into re-issuing a
+    // different (more dangerous) command.
+    interface PendingAgentAction {
+        title: string;
+        severity: 'low' | 'medium' | 'high';
+        suggestedCommand: string;
+        suggestedWorkingDir: string;
+        items: string[];
+    }
+    const pendingActionsRef = useRef<Map<string, PendingAgentAction>>(new Map());
+
     const handleDownloadModel = async (modelId: string, provider: ModelProvider) => {
         if (provider !== ModelProvider.LlamaCpp) return;
         setDownloadProgress({ status: 'downloading', progress: 0, modelId });
@@ -909,6 +925,23 @@ export const AIPanel = ({
                     ));
                 } : undefined,
                 onToolExecution: (event) => {
+                    // Capture any confirm_action emits into the pending-actions
+                    // registry so handleToolActionResponse can run them later
+                    // without trusting the model to re-issue the command.
+                    if (event.actions?.length) {
+                        for (const action of event.actions) {
+                            if (action.type === 'confirm_action') {
+                                pendingActionsRef.current.set(action.payload.actionId, {
+                                    title: action.payload.title,
+                                    severity: action.payload.severity,
+                                    suggestedCommand: action.payload.suggestedCommand,
+                                    suggestedWorkingDir: action.payload.suggestedWorkingDir,
+                                    items: action.payload.items,
+                                });
+                            }
+                        }
+                    }
+
                     // Primary match: per-call id (model can invoke the same
                     // tool multiple times in a single turn).
                     // Fallback: oldest 'executing' row for the same toolName.
@@ -1081,11 +1114,52 @@ export const AIPanel = ({
         }
     };
 
-    const handleToolActionResponse = useCallback((actionId: string, response: 'confirm' | 'dismiss') => {
-        const msg = response === 'confirm'
-            ? `**Action Confirmed:** ${actionId}\nProceed with the operation as described.`
-            : `**Action Rejected:** ${actionId}\nDo not proceed with this operation.`;
-        handleSendMessage(msg);
+    const handleToolActionResponse = useCallback(async (actionId: string, response: 'confirm' | 'dismiss') => {
+        const pending = pendingActionsRef.current.get(actionId);
+        // Single-use; remove so a double-click can't re-run the command.
+        pendingActionsRef.current.delete(actionId);
+
+        if (!pending) {
+            console.warn('[AIPanel] action response for unknown actionId', { actionId, response });
+            return;
+        }
+
+        if (response === 'dismiss') {
+            handleSendMessage(
+                `[user dismissed action ${actionId}: "${pending.title}"]\n` +
+                `Do NOT run \`${pending.suggestedCommand}\`. Acknowledge briefly and wait for the user's next instruction.`,
+            );
+            return;
+        }
+
+        // Confirm path: run the suggestedCommand verbatim via the same backend
+        // gate execute_command goes through (shell_classify::is_blocked + read/write
+        // confirmation prompts). The model never gets a chance to swap the command.
+        let outcome: string;
+        try {
+            const result = await invoke<{
+                stdout: string;
+                stderr: string;
+                exit_code: number;
+                timed_out: boolean;
+            }>('execute_command', {
+                cmd: pending.suggestedCommand,
+                workingDir: pending.suggestedWorkingDir,
+                timeoutSecs: null,
+            });
+            const body = [result.stdout, result.stderr].filter(Boolean).join('\n').trim();
+            outcome = `exit ${result.exit_code}${result.timed_out ? ' (timed out)' : ''}\n` +
+                `\`\`\`\n${body || '(no output)'}\n\`\`\``;
+        } catch (e) {
+            outcome = `execution failed: ${e instanceof Error ? e.message : String(e)}`;
+        }
+
+        handleSendMessage(
+            `[user confirmed action ${actionId}: "${pending.title}"]\n` +
+            `Ran \`${pending.suggestedCommand}\` in \`${pending.suggestedWorkingDir}\`.\n` +
+            `Result: ${outcome}\n\n` +
+            `Continue the user's original request based on this result.`,
+        );
     }, [handleSendMessage]);
 
     // Check if we are using a streaming provider
