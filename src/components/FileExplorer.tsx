@@ -428,7 +428,7 @@ export const FileExplorer = ({ onToggleAI, isAIPanelOpen, onContextChange, onAsk
                     data: {
                         name: 'This PC',
                         path: '',
-                        size: 0,
+                        size: drives.reduce((sum, d) => sum + d.size, 0),
                         is_dir: true,
                         children: drives,
                         last_modified: 0,
