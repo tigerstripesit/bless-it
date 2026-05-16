@@ -347,6 +347,8 @@ interface AIChatProps {
     /** Non-empty value pre-fills the chat input box. Used by "Ask Agent" to
      *  paste selected file paths so the user can type their intent. */
     prefillInput?: string;
+    /** Callback when the user responds to an inline confirm_action card. */
+    onActionResponse?: (actionId: string, response: 'confirm' | 'dismiss') => void;
 }
 
 export function AIChat({
@@ -359,6 +361,7 @@ export function AIChat({
     loadingStatus = 'Thinking...',
     skills = [],
     prefillInput,
+    onActionResponse,
 }: AIChatProps) {
     const styles = useStyles();
     const [inputValue, setInputValue] = useState('');
@@ -511,7 +514,7 @@ export function AIChat({
                                     {message.toolExecutions && message.toolExecutions.length > 0 && (
                                         <div style={{ marginBottom: '8px' }}>
                                             {message.toolExecutions.map((execution, idx) => (
-                                                <ToolCallDisplay key={idx} execution={execution} />
+                                                <ToolCallDisplay key={idx} execution={execution} onActionResponse={onActionResponse} />
                                             ))}
                                         </div>
                                     )}

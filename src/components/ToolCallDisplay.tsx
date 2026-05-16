@@ -23,6 +23,9 @@ import {
     ArrowSync16Regular,
     Code16Regular,
     Wrench16Regular,
+    Warning20Regular,
+    ErrorCircle20Regular,
+    Info20Regular,
 } from '@fluentui/react-icons';
 import { ToolExecutionData } from '@/types/ai-types';
 import { AgentActionChip } from './AgentActionChip';
@@ -99,13 +102,101 @@ const useStyles = makeStyles({
         alignItems: 'center',
         ...shorthands.gap('4px'),
     },
+    confirmCard: {
+        ...shorthands.border('1px', 'solid', tokens.colorNeutralStroke2),
+        ...shorthands.borderRadius('8px'),
+        backgroundColor: tokens.colorNeutralBackground1,
+        ...shorthands.padding('12px'),
+        display: 'flex',
+        flexDirection: 'column',
+        ...shorthands.gap('12px'),
+        marginTop: '8px',
+    },
+    cardHeader: {
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+    },
+    cardTitle: {
+        fontSize: '14px',
+        fontWeight: 600,
+    },
+    severityBadge: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        ...shorthands.gap('4px'),
+        ...shorthands.padding('2px', '8px'),
+        ...shorthands.borderRadius('4px'),
+        fontSize: '11px',
+        fontWeight: 600,
+        textTransform: 'uppercase',
+    },
+    severityLow: {
+        backgroundColor: tokens.colorPaletteLightGreenBackground2,
+        color: tokens.colorPaletteLightGreenForeground1,
+    },
+    severityMedium: {
+        backgroundColor: tokens.colorPaletteYellowBackground2,
+        color: tokens.colorPaletteYellowForeground1,
+    },
+    severityHigh: {
+        backgroundColor: tokens.colorPaletteRedBackground2,
+        color: tokens.colorPaletteRedForeground1,
+    },
+    cardDescription: {
+        fontSize: '13px',
+        color: tokens.colorNeutralForeground2,
+        lineHeight: 1.4,
+    },
+    itemList: {
+        display: 'flex',
+        flexDirection: 'column',
+        ...shorthands.gap('4px'),
+        backgroundColor: tokens.colorNeutralBackground2,
+        ...shorthands.padding('8px'),
+        ...shorthands.borderRadius('6px'),
+        maxHeight: '160px',
+        overflowY: 'auto',
+        ...shorthands.border('1px', 'solid', tokens.colorNeutralStroke2),
+    },
+    itemRow: {
+        display: 'flex',
+        alignItems: 'center',
+        ...shorthands.gap('8px'),
+        fontSize: '12px',
+        fontFamily: 'monospace',
+    },
+    sizeRow: {
+        display: 'flex',
+        ...shorthands.gap('12px'),
+        alignItems: 'baseline',
+    },
+    totalSize: {
+        fontSize: '14px',
+        fontWeight: 600,
+    },
+    cardActions: {
+        display: 'flex',
+        justifyContent: 'flex-end',
+        ...shorthands.gap('8px'),
+        paddingTop: '4px',
+    },
 });
 
 interface ToolCallDisplayProps {
     execution: ToolExecutionData;
+    onActionResponse?: (actionId: string, response: 'confirm' | 'dismiss') => void;
 }
 
-export function ToolCallDisplay({ execution }: ToolCallDisplayProps) {
+function formatSize(bytes: number): string {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    const size = bytes / Math.pow(1024, i);
+    return `${size.toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
+}
+
+export function ToolCallDisplay({ execution, onActionResponse }: ToolCallDisplayProps) {
     const styles = useStyles();
     const [isExpanded, setIsExpanded] = useState(true);
 
@@ -335,6 +426,73 @@ export function ToolCallDisplay({ execution }: ToolCallDisplayProps) {
                             </div>
                         </div>
                     )}
+
+                    {/* Confirm Action Inline Card */}
+                    {execution.actions?.map((action, idx) => {
+                        if (action.type !== 'confirm_action') return null;
+                        const p = action.payload;
+                        const SeverityIcon = p.severity === 'high' ? ErrorCircle20Regular
+                            : p.severity === 'medium' ? Warning20Regular
+                            : Info20Regular;
+                        const severityClass = p.severity === 'high' ? styles.severityHigh
+                            : p.severity === 'medium' ? styles.severityMedium
+                            : styles.severityLow;
+                        const severityLabel = p.severity === 'high' ? 'High Risk'
+                            : p.severity === 'medium' ? 'Medium Risk'
+                            : 'Low Risk';
+                        return (
+                            <div key={idx} className={styles.confirmCard}>
+                                <div className={styles.cardHeader}>
+                                    <Text className={styles.cardTitle}>{p.title}</Text>
+                                    <span className={`${styles.severityBadge} ${severityClass}`}>
+                                        <SeverityIcon fontSize={14} />
+                                        {severityLabel}
+                                    </span>
+                                </div>
+                                {p.description && (
+                                    <Text className={styles.cardDescription}>{p.description}</Text>
+                                )}
+                                {p.items.length > 0 && (
+                                    <div>
+                                        <Text size={200} weight="semibold" style={{ marginBottom: '4px', display: 'block' }}>
+                                            Items ({p.items.length})
+                                        </Text>
+                                        <div className={styles.itemList}>
+                                            {p.items.map((item, i) => (
+                                                <div key={i} className={styles.itemRow}>
+                                                    <Text size={200} style={{ color: tokens.colorNeutralForeground3, flexShrink: 0 }}>{i + 1}.</Text>
+                                                    <Text>{item}</Text>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+                                {p.totalSize > 0 && (
+                                    <div className={styles.sizeRow}>
+                                        <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>Total Size</Text>
+                                        <Text className={styles.totalSize}>{formatSize(p.totalSize)}</Text>
+                                    </div>
+                                )}
+                                <div className={styles.cardActions}>
+                                    <Button
+                                        appearance="secondary"
+                                        size="small"
+                                        onClick={() => onActionResponse?.(p.actionId, 'dismiss')}
+                                    >
+                                        Dismiss
+                                    </Button>
+                                    <Button
+                                        appearance="primary"
+                                        size="small"
+                                        style={p.severity === 'high' ? { backgroundColor: '#d13438', color: 'white' } as React.CSSProperties : undefined}
+                                        onClick={() => onActionResponse?.(p.actionId, 'confirm')}
+                                    >
+                                        {p.severity === 'high' ? 'Proceed Anyway' : 'Execute'}
+                                    </Button>
+                                </div>
+                            </div>
+                        );
+                    })}
 
                     {/* Result Section (if available) */}
                     {execution.result && !execution.error && (
