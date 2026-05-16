@@ -30,6 +30,66 @@ import {
 import { ToolExecutionData } from '@/types/ai-types';
 import { AgentActionChip } from './AgentActionChip';
 
+/** Lightweight Fluent-styled table for browser_extract array results.
+ *  Picks columns from the first row's keys; renders ≤50 rows, ≤6 columns
+ *  to keep the chat bubble manageable. */
+function BrowserExtractTable({ rows }: { rows: Array<Record<string, unknown>> }) {
+    if (rows.length === 0) return null;
+    const columns = Object.keys(rows[0]).slice(0, 6);
+    const display = rows.slice(0, 50);
+    const overflow = rows.length - display.length;
+    return (
+        <div style={{ padding: '8px 12px 12px' }}>
+            <div style={{
+                overflowX: 'auto',
+                border: `1px solid ${tokens.colorNeutralStroke2}`,
+                borderRadius: 4,
+            }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                    <thead>
+                        <tr style={{ background: tokens.colorNeutralBackground3 }}>
+                            {columns.map((c) => (
+                                <th key={c} style={{
+                                    textAlign: 'left',
+                                    padding: '6px 8px',
+                                    borderBottom: `1px solid ${tokens.colorNeutralStroke2}`,
+                                    fontWeight: 600,
+                                }}>{c}</th>
+                            ))}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {display.map((row, i) => (
+                            <tr key={i}>
+                                {columns.map((c) => {
+                                    const v = row[c];
+                                    const text = v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v);
+                                    return (
+                                        <td key={c} style={{
+                                            padding: '6px 8px',
+                                            borderBottom: `1px solid ${tokens.colorNeutralStroke2}`,
+                                            verticalAlign: 'top',
+                                            maxWidth: 320,
+                                            overflow: 'hidden',
+                                            textOverflow: 'ellipsis',
+                                            whiteSpace: 'nowrap',
+                                        }}>{text}</td>
+                                    );
+                                })}
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+            {overflow > 0 && (
+                <Text size={200} style={{ color: tokens.colorNeutralForeground3, marginTop: 4, display: 'block' }}>
+                    … {overflow} more rows elided
+                </Text>
+            )}
+        </div>
+    );
+}
+
 const useStyles = makeStyles({
     container: {
         ...shorthands.margin('8px', '0'),
@@ -542,6 +602,14 @@ export function ToolCallDisplay({ execution, onActionResponse }: ToolCallDisplay
                                             background: tokens.colorNeutralBackground1,
                                         }}
                                     />
+                                )}
+                                {p.kind === 'browser_extract' && Array.isArray((p as any).data) && (p as any).data.length > 0 && (
+                                    <BrowserExtractTable rows={(p as any).data as Array<Record<string, unknown>>} />
+                                )}
+                                {p.kind === 'browser_extract' && (p as any).data && !Array.isArray((p as any).data) && (
+                                    <div className={styles.codeBlock} style={{ margin: '8px 12px' }}>
+                                        {JSON.stringify((p as any).data, null, 2)}
+                                    </div>
                                 )}
                             </div>
                         );

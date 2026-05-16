@@ -273,11 +273,54 @@ For password fields, call browser_observe first so the app can detect password t
     },
 };
 
+const BROWSER_EXTRACT_TOOL: Tool = {
+    type: 'function',
+    function: {
+        name: 'browser_extract',
+        description: `Extract structured data from the current page using a JSON-Schema-flavored selector map. Two shapes are supported:
+
+1) Array of records — schema.type="array", schema["x-selector"] is the CSS row selector, schema.items.properties maps field names to per-field { "x-selector": <within-row CSS>, "x-attr"?: <attribute name> }. textContent if x-attr omitted.
+
+2) Single record — schema.type="object", schema.properties maps field names the same way (selectors are relative to selector_hint or document).
+
+Example (top 5 article titles + URLs from Wikipedia search):
+{
+  "type": "array",
+  "x-selector": ".mw-search-result-heading",
+  "items": {
+    "type": "object",
+    "properties": {
+      "title": { "type": "string", "x-selector": "a" },
+      "url":   { "type": "string", "x-selector": "a", "x-attr": "href" }
+    }
+  }
+}
+
+Returns { url, title, data, scope }. Array results capped at 200 rows.`,
+        parameters: {
+            type: 'object',
+            properties: {
+                session_id: { type: 'string' },
+                schema: {
+                    type: 'object',
+                    description: 'JSON-Schema-flavored description of the data to extract (see tool description for x-selector/x-attr conventions).',
+                },
+                selector_hint: {
+                    type: 'string',
+                    description: 'Optional CSS selector to scope extraction. Defaults to "body".',
+                },
+            },
+            required: ['session_id', 'schema'],
+        },
+    },
+};
+
 const BROWSER_TOOLS: Tool[] = [
     BROWSER_OPEN_TOOL,
     BROWSER_NAVIGATE_TOOL,
     BROWSER_OBSERVE_TOOL,
     BROWSER_ACT_TOOL,
+    BROWSER_EXTRACT_TOOL,
     BROWSER_CLOSE_TOOL,
 ];
 

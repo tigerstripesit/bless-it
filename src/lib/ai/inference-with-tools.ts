@@ -211,6 +211,7 @@ const BROWSER_METHOD_MAP: Record<string, string> = {
     browser_navigate: 'browser.navigate',
     browser_observe: 'browser.observe',
     browser_act: 'browser.act',
+    browser_extract: 'browser.extract',
     browser_close: 'browser.close',
 };
 
@@ -392,6 +393,16 @@ async function executeBrowserTool(
             summary = `Opened browser session "${(result as any)?.session_id ?? sessionId}".`;
         } else if (toolName === 'browser_close') {
             summary = `Closed browser session "${sessionId}".`;
+        } else if (toolName === 'browser_extract') {
+            const r = result as { url?: string; title?: string; data?: unknown; scope?: string };
+            const data = r?.data;
+            const rowCount = Array.isArray(data) ? data.length : (data && typeof data === 'object' ? 1 : 0);
+            // Send the structured data back to the model as compact JSON so
+            // it can quote / reason over it. The UI gets the same payload
+            // via the preview blob and renders a table.
+            const json = JSON.stringify(data, null, 2);
+            const truncatedJson = json.length > 4_000 ? json.slice(0, 4_000) + '\n… (truncated)' : json;
+            summary = `Extracted ${rowCount} ${rowCount === 1 ? 'record' : 'records'} from scope "${r?.scope ?? 'body'}" on ${r?.url ?? '(unknown url)'}:\n${truncatedJson}`;
         } else {
             summary = JSON.stringify(result);
         }
