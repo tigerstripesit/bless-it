@@ -10,7 +10,8 @@
     "package": "node scripts/build-sidecar.mjs",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "install-chromium": "playwright install --with-deps chromium"
+    "install-chromium": "playwright install --with-deps chromium",
+    "postinstall": "node node_modules/playwright-core/cli.js install chromium"
   },
   "dependencies": {
     "playwright-core": "1.49.1"

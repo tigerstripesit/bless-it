@@ -1,10 +1,28 @@
 import type { Browser, BrowserContext, Page } from 'playwright-core';
 import { chromium } from 'playwright-core';
+import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { mkdir } from 'node:fs/promises';
 import { log } from './log.js';
 import type { AxNode } from './snapshot.js';
+
+function ensureChromiumInstalled(): void {
+    try {
+        const exePath = chromium.executablePath();
+        if (!existsSync(exePath)) {
+            throw new Error(`chromium binary not found at expected path: ${exePath}`);
+        }
+    } catch {
+        const cwd = process.cwd();
+        throw new Error(
+            `Chromium is not installed. Run the following from the sidecar directory:\n\n` +
+            `  cd ${cwd}\n` +
+            `  npm run postinstall\n\n` +
+            `This will download the Chromium browser binary required for browser automation.`
+        );
+    }
+}
 
 export interface SessionObservation {
     ax: AxNode[];
@@ -36,6 +54,9 @@ function profileDir(sessionId: string): string {
 }
 
 export async function getOrOpenSession(opts: OpenOptions): Promise<SessionRef> {
+    // Verify Chromium is installed before attempting to launch.
+    ensureChromiumInstalled();
+
     const existing = sessions.get(opts.sessionId);
     if (existing) return existing;
 
