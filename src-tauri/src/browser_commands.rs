@@ -29,7 +29,8 @@ const SIDECAR_REL_DEV: &str = "sidecar/browser/dist/index.js";
 const SIDECAR_REL_DEV_TS: &str = "sidecar/browser/src/index.ts";
 /// Name of the bundled sidecar binary (no extension; .exe added on Windows).
 const SIDECAR_BIN_NAME: &str = "ittoolkit-browser";
-const RPC_TIMEOUT_SECS: u64 = 45;
+const SIDECAR_STARTUP_TIMEOUT_SECS: u64 = 30;
+const RPC_TIMEOUT_SECS: u64 = 90;
 const FRAME_EVENT: &str = "browser-frame";
 
 /// Source of the sidecar entry — bundled binary (packaged build) or a Node
@@ -179,10 +180,15 @@ async fn ensure_spawned(
         }
     });
 
+    // Channel for the stdout reader to signal startup success/failure.
+    let (startup_tx, startup_rx) = oneshot::channel::<Result<(), String>>();
+
     // Stdout reader — parse JSON-RPC frames and route to pending callers or
-    // emit as Tauri events for notifications.
+    // emit as Tauri events for notifications. Also watches for sidecar.ready
+    // and sidecar.error notifications during startup.
     let inner_for_reader = Arc::clone(&inner);
     let app_for_reader = app.clone();
+    let mut startup_sent: Option<oneshot::Sender<Result<(), String>>> = Some(startup_tx);
     tokio::spawn(async move {
         let mut reader = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = reader.next_line().await {
@@ -194,9 +200,33 @@ async fn ensure_spawned(
                 Ok(v) => v,
                 Err(e) => {
                     log::warn!("sidecar emitted unparseable line: {} ({})", trimmed, e);
+                    // During startup, treat a parse error as a failure signal.
+                    if let Some(tx) = startup_sent.take() {
+                        let _ = tx.send(Err(format!("sidecar emitted unparseable output: {}", e)));
+                    }
                     continue;
                 }
             };
+
+            // Check for startup notifications before handling normal frames.
+            if let (Some(_), Some(method)) = (startup_sent.as_ref(), frame.get("method").and_then(|v| v.as_str())) {
+                match method {
+                    "sidecar.ready" => {
+                        let tx = startup_sent.take().unwrap();
+                        let _ = tx.send(Ok(()));
+                    }
+                    "sidecar.error" => {
+                        let tx = startup_sent.take().unwrap();
+                        let msg = frame
+                            .get("params")
+                            .and_then(|p| p.get("message"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown sidecar error");
+                        let _ = tx.send(Err(format!("sidecar startup error: {}", msg)));
+                    }
+                    _ => {}
+                }
+            }
 
             let id_opt = frame.get("id").and_then(|v| v.as_u64());
             if let Some(id) = id_opt {
@@ -222,19 +252,97 @@ async fn ensure_spawned(
                 }
             } else if frame.get("method").is_some() {
                 // Notification — forward to the frontend as a Tauri event.
-                if let Err(e) = app_for_reader.emit(FRAME_EVENT, frame.clone()) {
-                    log::warn!("failed to emit browser-frame: {}", e);
+                // Skip sidecar.ready/sidecar.error — those are internal.
+                let method = frame.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                if method != "sidecar.ready" && method != "sidecar.error" {
+                    if let Err(e) = app_for_reader.emit(FRAME_EVENT, frame.clone()) {
+                        log::warn!("failed to emit browser-frame: {}", e);
+                    }
                 }
             }
+        }
+
+        // If stdout closed before startup was signalled, notify.
+        if let Some(tx) = startup_sent.take() {
+            let _ = tx.send(Err("browser sidecar exited during startup (stdout closed)".to_string()));
         }
         log::info!("browser sidecar stdout closed");
     });
 
+    // Store child/stderr in the supervisor state immediately so the sidecar
+    // process is tracked even if startup hasn't finished yet.
     {
         let mut guard = inner.lock().await;
         guard.child = Some(child);
         guard.stdin = Some(stdin);
     }
+
+    // Wait for the sidecar to signal readiness (or error) within the startup
+    // timeout.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(SIDECAR_STARTUP_TIMEOUT_SECS),
+        startup_rx,
+    )
+    .await
+    {
+        Ok(Ok(Ok(()))) => {
+            log::info!("browser sidecar ready");
+        }
+        Ok(Ok(Err(e))) => {
+            // Startup error — clean up (close child stdin will trigger clean
+            // shutdown in the sidecar).
+            let mut guard = inner.lock().await;
+            guard.child = None;
+            let _ = guard.stdin.take();
+            guard.pending.clear();
+            return Err(e);
+        }
+        Ok(Err(_)) => {
+            let mut guard = inner.lock().await;
+            guard.child = None;
+            let _ = guard.stdin.take();
+            guard.pending.clear();
+            return Err("browser sidecar dropped startup channel".to_string());
+        }
+        Err(_) => {
+            let mut guard = inner.lock().await;
+            guard.child = None;
+            let _ = guard.stdin.take();
+            guard.pending.clear();
+            return Err(format!(
+                "browser sidecar startup timeout after {}s",
+                SIDECAR_STARTUP_TIMEOUT_SECS
+            ));
+        }
+    }
+
+    // Pre-warm: send a JSON-RPC notification (no id) to browser.open for a
+    // throwaway session. This launches Chromium in the background so the first
+    // real request doesn't pay the full cold-start cost.
+    tokio::spawn({
+        let inner = Arc::clone(&inner);
+        async move {
+            let frame = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "browser.open",
+                "params": {
+                    "session_id": "_warmup",
+                    "profile": "ephemeral"
+                },
+            });
+            let mut line = match serde_json::to_string(&frame) {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+            line.push('\n');
+            let mut guard = inner.lock().await;
+            if let Some(stdin) = guard.stdin.as_mut() {
+                let _ = stdin.write_all(line.as_bytes()).await;
+                let _ = stdin.flush().await;
+            }
+        }
+    });
+
     Ok(())
 }
 
