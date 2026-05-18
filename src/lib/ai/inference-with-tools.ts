@@ -212,6 +212,7 @@ const BROWSER_METHOD_MAP: Record<string, string> = {
     browser_observe: 'browser.observe',
     browser_act: 'browser.act',
     browser_extract: 'browser.extract',
+    browser_mark: 'browser.mark',
     browser_close: 'browser.close',
 };
 

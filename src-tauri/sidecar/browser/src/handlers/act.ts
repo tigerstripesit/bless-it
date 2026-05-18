@@ -1,17 +1,27 @@
 // browser_act handler — click/type/select/scroll/press/hover by AX index.
 //
 // Resolves params.index against the session's cached AX snapshot. If the
-// cache is stale (>30s) or absent, we re-snapshot first. The cached node's
-// role + accessible name is then mapped to a Playwright locator
-// (page.getByRole(role, { name })). This is more resilient than coordinate
-// targeting and survives layout changes; it falls back to nth-of-role when
-// the name is ambiguous.
+// cache is stale (>30s) or the URL changed since last observe, we re-snapshot.
+//
+// Locator resolution uses a multi-strategy chain with a per-strategy timeout
+// so a single bad strategy never blocks for 30s. Strategies in priority order:
+//   1. getByRole(role, { name, exact })    — standard AX match
+//   2. getByText(name, { exact })          — text/statictext nodes in SPAs
+//   3. [aria-label="name"]                 — custom ARIA labels (chat apps etc.)
+//   4. [title="name"]                      — title attributes
+//   5. >> [aria-label="name"]              — shadow DOM piercing
+//   6. getByRole(role).first()             — nth-of-role last resort
+//
+// If the final click/fill still throws, a screenshot is attached to the error
+// so the model can pivot to visual reasoning instead of retrying blindly.
 
 import type { Page, Locator } from 'playwright-core';
 import { getSession } from '../sessions.js';
-import { captureAxTree, type AxNode } from '../snapshot.js';
+import { captureAxTree, captureScreenshot, type AxNode } from '../snapshot.js';
+import { log } from '../log.js';
 
 const SNAPSHOT_STALE_MS = 30_000;
+const STRATEGY_TIMEOUT_MS = 5_000;
 
 type ActionKind = 'click' | 'type' | 'select' | 'scroll' | 'press' | 'hover';
 const ALLOWED_ACTIONS = new Set<ActionKind>(['click', 'type', 'select', 'scroll', 'press', 'hover']);
@@ -25,33 +35,81 @@ interface ActParams {
 }
 
 interface ActResult {
-    /** Final URL after the action (may differ if click triggered navigation). */
     url: string;
     title: string;
-    /** Tags that were on the targeted node at action time. Echoed for audit. */
     target_tags?: string[];
     target_role?: string;
     target_name?: string;
 }
 
 function pwRole(axRole: string): Parameters<Page['getByRole']>[0] {
-    // The AX snapshot uses ARIA role names that mostly match Playwright's
-    // built-in role enum. A few sidecar-emitted roles need normalization.
+    // Normalize ARIA roles to Playwright's role enum. text/statictext are NOT
+    // paragraph — they are generic text nodes rendered as span/div in SPAs.
+    // We handle them via getByText() in resolveLocator instead.
     const r = axRole.toLowerCase();
-    if (r === 'statictext' || r === 'text') return 'paragraph';
     return r as Parameters<Page['getByRole']>[0];
+}
+
+/** Try a locator with a short timeout. Returns the locator if ≥1 match found, else null. */
+async function tryLocator(loc: Locator): Promise<Locator | null> {
+    const count = await Promise.race([
+        loc.count(),
+        new Promise<number>((_, rej) =>
+            setTimeout(() => rej(new Error('strategy timeout')), STRATEGY_TIMEOUT_MS)
+        ),
+    ]).catch(() => 0);
+    if (count >= 1) return count === 1 ? loc : loc.first();
+    return null;
 }
 
 async function resolveLocator(page: Page, node: AxNode): Promise<Locator> {
     const role = pwRole(node.role);
-    if (node.name) {
-        const byNamed = page.getByRole(role, { name: node.name, exact: true });
-        const count = await byNamed.count().catch(() => 0);
-        if (count === 1) return byNamed;
-        if (count > 1) return byNamed.first();
+    const name = node.name ?? '';
+    const isTextNode = node.role === 'text' || node.role === 'StaticText';
+
+    // Strategy 1: exact role + name (standard AX match — works for buttons, links, etc.)
+    if (name && !isTextNode) {
+        const loc = await tryLocator(page.getByRole(role, { name, exact: true }));
+        if (loc) return loc;
     }
-    // Fallback: index-within-role (rough but better than failing). We use
-    // the AX node index narrowed to same-role nodes captured before it.
+
+    // Strategy 2: getByText — the right approach for text/statictext nodes in SPAs.
+    // WhatsApp, Gmail etc. render these as <span>/<div> with no <p> tag; getByRole
+    // ('paragraph') would find nothing. getByText matches the visible text content.
+    if (name && isTextNode) {
+        const loc = await tryLocator(page.getByText(name, { exact: true }));
+        if (loc) return loc;
+    }
+
+    // Strategy 3: aria-label attribute (custom components, chat lists, icon buttons)
+    if (name) {
+        const escaped = name.replace(/"/g, '\\"');
+        const loc = await tryLocator(page.locator(`[aria-label="${escaped}"]`));
+        if (loc) return loc;
+    }
+
+    // Strategy 4: title attribute
+    if (name) {
+        const escaped = name.replace(/"/g, '\\"');
+        const loc = await tryLocator(page.locator(`[title="${escaped}"]`));
+        if (loc) return loc;
+    }
+
+    // Strategy 5: shadow DOM piercing — catches elements nested inside Web Components
+    if (name) {
+        const escaped = name.replace(/"/g, '\\"');
+        const loc = await tryLocator(page.locator(`css=[aria-label="${escaped}"]`));
+        if (loc) return loc;
+    }
+
+    // Strategy 6: nth-of-role fallback. For text nodes with no useful role, fall
+    // back to getByText without exact match as a last DOM attempt.
+    if (name && isTextNode) {
+        const loc = await tryLocator(page.getByText(name));
+        if (loc) return loc;
+    }
+
+    // Last resort: return nth-of-role (may be wrong element, but avoids infinite hang)
     return page.getByRole(role).first();
 }
 
@@ -68,14 +126,23 @@ export async function handleAct(params: ActParams): Promise<ActResult> {
     }
 
     const now = Date.now();
+    const currentUrl = ref.page.url();
     let observation = ref.lastObservation;
-    if (!observation || now - observation.capturedAt > SNAPSHOT_STALE_MS) {
+
+    // Invalidate if stale OR if URL changed (e.g. SPA navigation happened between observe and act)
+    const urlChanged = observation && observation.url !== currentUrl;
+    if (!observation || now - observation.capturedAt > SNAPSHOT_STALE_MS || urlChanged) {
+        if (urlChanged) {
+            log.info('browser.act: URL changed since last observe, re-capturing AX tree', {
+                from: observation?.url, to: currentUrl,
+            });
+        }
         const ax = await captureAxTree(ref.page, 80);
-        observation = { ax, capturedAt: now };
+        observation = { ax, capturedAt: now, url: currentUrl };
         ref.lastObservation = observation;
     }
 
-    // `scroll` and `press` don't require a target node — handle them first.
+    // scroll and press don't target a specific node.
     if (action === 'scroll') {
         const direction = (params.text ?? 'down').toLowerCase();
         const delta = direction === 'up' ? -600 : direction === 'top' ? -1_000_000 : direction === 'bottom' ? 1_000_000 : 600;
@@ -92,38 +159,44 @@ export async function handleAct(params: ActParams): Promise<ActResult> {
         const node = observation.ax[idx];
         const locator = await resolveLocator(ref.page, node);
 
-        switch (action) {
-            case 'click':
-                await locator.click();
-                break;
-            case 'type': {
-                const text = params.text ?? '';
-                await locator.fill(text);
-                if (params.submit) {
-                    await locator.press('Enter');
+        try {
+            switch (action) {
+                case 'click':
+                    await locator.click();
+                    break;
+                case 'type': {
+                    const text = params.text ?? '';
+                    await locator.fill(text);
+                    if (params.submit) {
+                        await locator.press('Enter');
+                    }
+                    break;
                 }
-                break;
+                case 'select': {
+                    const value = params.text ?? '';
+                    await locator.selectOption(value);
+                    break;
+                }
+                case 'hover':
+                    await locator.hover();
+                    break;
             }
-            case 'select': {
-                const value = params.text ?? '';
-                await locator.selectOption(value);
-                break;
-            }
-            case 'hover':
-                await locator.hover();
-                break;
+        } catch (err) {
+            // Tier 4: vision fallback — attach screenshot to the error so the model
+            // can pivot to visual reasoning (browser_mark) instead of retrying blindly.
+            const screenshot = await captureScreenshot(ref.page).catch(() => undefined);
+            const msg = err instanceof Error ? err.message : String(err);
+            const rich = new Error(`browser.act failed: ${msg}`);
+            (rich as any).screenshot = screenshot;
+            throw rich;
         }
     }
 
-    // Re-derive page state. After click/type-submit the URL may have changed.
     const [url, title] = await Promise.all([
         Promise.resolve(ref.page.url()),
         ref.page.title().catch(() => ''),
     ]);
 
-    // Invalidate cached observation; the agent should call browser_observe
-    // to see the post-action state. Returning the previous node tags is
-    // still useful for audit ("what did we just click?").
     let target_role: string | undefined;
     let target_name: string | undefined;
     let target_tags: string[] | undefined;

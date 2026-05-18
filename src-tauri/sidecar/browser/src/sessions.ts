@@ -85,6 +85,8 @@ export async function autoInstallChromiumIfNeeded(
 export interface SessionObservation {
     ax: AxNode[];
     capturedAt: number;
+    /** URL at capture time — used to detect page navigations that invalidate the snapshot. */
+    url: string;
 }
 
 export interface SessionRef {

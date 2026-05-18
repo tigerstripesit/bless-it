@@ -47,7 +47,7 @@ fn has_tag(params: &Value, tag: &str) -> bool {
 
 pub fn classify(method: &str, params: &Value) -> BrowserRisk {
     match method {
-        "browser.open" | "browser.close" | "browser.observe" | "browser.extract" => BrowserRisk::Read,
+        "browser.open" | "browser.close" | "browser.observe" | "browser.extract" | "browser.mark" => BrowserRisk::Read,
 
         "browser.navigate" => {
             let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("");
@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn read_methods_are_read() {
-        for m in ["browser.open", "browser.close", "browser.observe", "browser.extract"] {
+        for m in ["browser.open", "browser.close", "browser.observe", "browser.extract", "browser.mark"] {
             assert_eq!(classify(m, &json!({})), BrowserRisk::Read, "{}", m);
         }
     }

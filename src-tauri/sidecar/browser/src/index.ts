@@ -33,13 +33,14 @@ async function main(): Promise<void> {
     let closeAllSessions: () => Promise<void>;
 
     try {
-        const [open, navigate, observe, close, act, extract, sessions] = await Promise.all([
+        const [open, navigate, observe, close, act, extract, mark, sessions] = await Promise.all([
             import('./handlers/open.js'),
             import('./handlers/navigate.js'),
             import('./handlers/observe.js'),
             import('./handlers/close.js'),
             import('./handlers/act.js'),
             import('./handlers/extract.js'),
+            import('./handlers/mark.js'),
             import('./sessions.js'),
         ]);
 
@@ -50,6 +51,7 @@ async function main(): Promise<void> {
             'browser.observe': observe.handleObserve,
             'browser.act': act.handleAct,
             'browser.extract': extract.handleExtract,
+            'browser.mark': mark.handleMark,
             'browser.close': close.handleClose,
         };
         closeAllSessions = sessions.closeAllSessions;

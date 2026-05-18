@@ -39,6 +39,7 @@ export function classifyBrowserAction({ method, params, hints }: ClassifyArgs): 
         case 'browser_close':
         case 'browser_observe':
         case 'browser_extract':
+        case 'browser_mark':
             return 'read';
 
         case 'browser_navigate': {
