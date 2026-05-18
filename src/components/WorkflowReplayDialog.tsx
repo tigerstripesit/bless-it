@@ -5,19 +5,18 @@
  *
  * Walks a workflow step-by-step:
  *   1. Loads parameter-bound steps via workflow_replay_bind.
- *   2. For each step: classifies it. Read steps run autonomously.
- *      Write/destructive steps stop on a confirmation card that shows
- *      the most recent observation's screenshot + a one-line intent.
- *   3. Dispatches via browser_rpc. Updates a step list with status icons.
- *   4. Stops on first failure (errors propagate to the user as-is).
- *
- * The cached observation is whichever `browser_observe` ran most recently
- * in the replay — the very first step in any browser workflow should be
- * `browser_open` followed by `browser_observe`, so by the time a write
- * step is reached we have something to show.
+ *   2. All browser.open steps are forced to headed:true so the user always
+ *      sees a real browser window.
+ *   3. For each step: classifies it. Read steps run autonomously.
+ *      Write/destructive steps stop on a confirmation card.
+ *   4. The user can pause the replay at any time ("Take over") to handle
+ *      logins, CAPTCHAs, or 2FA in the headed window, then click Resume.
+ *   5. When a step errors (auth wall, CAPTCHA, etc.) the replay pauses
+ *      automatically — fix it in the browser, then click "Resume from
+ *      next step".
  */
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
     makeStyles,
@@ -40,6 +39,7 @@ import {
     ErrorCircle16Filled,
     ArrowSync16Regular,
     Pause16Regular,
+    Person16Regular,
 } from '@fluentui/react-icons';
 import {
     classifyBrowserAction,
@@ -48,7 +48,7 @@ import {
 } from '@/lib/ai/browser-classify';
 
 interface WorkflowStep {
-    tool: string; // "browser.open" / "browser.navigate" / etc.
+    tool: string;
     params: Record<string, unknown>;
     classification: string;
     observedUrl?: string;
@@ -71,7 +71,7 @@ interface WorkflowFile {
     steps: WorkflowStep[];
 }
 
-type StepStatus = 'pending' | 'running' | 'awaiting_approval' | 'done' | 'error' | 'denied';
+type StepStatus = 'pending' | 'running' | 'awaiting_approval' | 'done' | 'error' | 'denied' | 'skipped';
 
 interface StepRuntimeState {
     status: StepStatus;
@@ -93,7 +93,7 @@ const useStyles = makeStyles({
         marginBottom: '8px',
     },
     stepList: {
-        maxHeight: '320px',
+        maxHeight: '280px',
         overflow: 'auto',
         border: `1px solid ${tokens.colorNeutralStroke2}`,
         borderRadius: '6px',
@@ -124,19 +124,33 @@ const useStyles = makeStyles({
         textTransform: 'uppercase',
         letterSpacing: '0.04em',
     },
-    approvalCard: {
+    actionCard: {
         marginTop: '12px',
         border: `1px solid ${tokens.colorNeutralStroke2}`,
         borderRadius: '8px',
         padding: '12px',
         background: tokens.colorNeutralBackground2,
     },
+    humanCard: {
+        marginTop: '12px',
+        border: `1px solid ${tokens.colorPaletteBlueBorderActive}`,
+        borderRadius: '8px',
+        padding: '12px',
+        background: '#f0f6ff',
+    },
+    errorCard: {
+        marginTop: '12px',
+        border: `1px solid ${tokens.colorPaletteRedBorder2}`,
+        borderRadius: '8px',
+        padding: '12px',
+        background: '#fff0f0',
+    },
 });
 
 function StepIcon({ status }: { status: StepStatus }) {
     if (status === 'done') return <CheckmarkCircle16Filled color={tokens.colorPaletteGreenForeground1} />;
     if (status === 'error') return <ErrorCircle16Filled color={tokens.colorPaletteRedForeground1} />;
-    if (status === 'denied') return <DismissCircle16Filled color={tokens.colorPaletteRedForeground1} />;
+    if (status === 'denied' || status === 'skipped') return <DismissCircle16Filled color={tokens.colorNeutralForeground3} />;
     if (status === 'running') return <ArrowSync16Regular />;
     if (status === 'awaiting_approval') return <Pause16Regular />;
     return <span style={{ width: 16, height: 16, display: 'inline-block', border: `2px solid ${tokens.colorNeutralStroke2}`, borderRadius: '50%' }} />;
@@ -144,6 +158,16 @@ function StepIcon({ status }: { status: StepStatus }) {
 
 function methodToToolName(method: string): string {
     return method.replace('browser.', 'browser_');
+}
+
+/** Force every browser.open step to open a visible (headed) window so the
+ *  user can always see what's happening and take over for auth/CAPTCHA. */
+function applyReplayOverrides(steps: WorkflowStep[]): WorkflowStep[] {
+    return steps.map((s) =>
+        s.tool === 'browser.open'
+            ? { ...s, params: { ...s.params, headed: true } }
+            : s,
+    );
 }
 
 export function WorkflowReplayDialog({ slug, name, onClose }: Props) {
@@ -156,13 +180,20 @@ export function WorkflowReplayDialog({ slug, name, onClose }: Props) {
     const [error, setError] = useState<string | null>(null);
     const [latestScreenshot, setLatestScreenshot] = useState<string | undefined>(undefined);
     const [latestUrl, setLatestUrl] = useState<string | undefined>(undefined);
-    const [latestTags, setLatestTags] = useState<Record<number, string[]>>({});
+
+    // Approval state for write/destructive steps.
     const [pendingApproval, setPendingApproval] = useState<{
         stepIndex: number;
         risk: BrowserRisk;
         intent: string;
         resolve: (ok: boolean) => void;
     } | null>(null);
+
+    // Human takeover state — pauses the loop until the user clicks Resume.
+    // resolve() advances to the next step; the ref escapes the closure.
+    const humanResumeRef = useRef<((skipStep: boolean) => void) | null>(null);
+    const [humanMode, setHumanMode] = useState<'paused' | 'error-recovery' | null>(null);
+    const [humanMessage, setHumanMessage] = useState('');
 
     useEffect(() => {
         (async () => {
@@ -175,12 +206,43 @@ export function WorkflowReplayDialog({ slug, name, onClose }: Props) {
         })();
     }, [slug]);
 
+    // Notify page.tsx so it can show the BrowserView split.
+    useEffect(() => {
+        return () => {
+            window.dispatchEvent(new CustomEvent('workflow-replay-stopped'));
+        };
+    }, []);
+
     const allParamsFilled = useMemo(() => {
         if (!workflow) return false;
         return workflow.parameters
             .filter((p) => p.required)
             .every((p) => (params[p.name] ?? '').trim().length > 0);
     }, [workflow, params]);
+
+    /** Pause the replay loop until the user clicks Resume or Skip. */
+    const waitForHuman = useCallback((message: string, mode: 'paused' | 'error-recovery'): Promise<boolean> => {
+        return new Promise<boolean>((resolve) => {
+            humanResumeRef.current = resolve;
+            setHumanMessage(message);
+            setHumanMode(mode);
+        });
+    }, []);
+
+    const handleResume = useCallback((skipStep: boolean) => {
+        const resolve = humanResumeRef.current;
+        humanResumeRef.current = null;
+        setHumanMode(null);
+        setHumanMessage('');
+        resolve?.(skipStep);
+    }, []);
+
+    const handleTakeOver = useCallback(() => {
+        waitForHuman(
+            'Browser handed to you. Complete any login, CAPTCHA, or 2FA in the browser window, then click Resume.',
+            'paused',
+        );
+    }, [waitForHuman]);
 
     const runStep = useCallback(
         async (step: WorkflowStep, stepIndex: number): Promise<{ ok: boolean; result?: unknown; error?: string }> => {
@@ -221,8 +283,6 @@ export function WorkflowReplayDialog({ slug, name, onClose }: Props) {
                 const result = await invoke<Record<string, unknown>>('browser_rpc', {
                     request: { method: step.tool, params: step.params },
                 });
-                // Cache screenshot from browser.observe results so subsequent
-                // write-step approvals can render the live page.
                 if (step.tool === 'browser.observe') {
                     const screenshot = (result as { screenshot?: string }).screenshot;
                     if (screenshot) setLatestScreenshot(screenshot);
@@ -241,36 +301,58 @@ export function WorkflowReplayDialog({ slug, name, onClose }: Props) {
         if (!workflow) return;
         setRunning(true);
         setError(null);
+        window.dispatchEvent(new CustomEvent('workflow-replay-started'));
         try {
             const parameters: Record<string, unknown> = {};
             for (const p of workflow.parameters) parameters[p.name] = params[p.name];
-            const bound = await invoke<WorkflowStep[]>('workflow_replay_bind', {
-                slug,
-                parameters,
-            });
+            const raw = await invoke<WorkflowStep[]>('workflow_replay_bind', { slug, parameters });
+            // Force headed mode so the browser window is always visible.
+            const bound = applyReplayOverrides(raw);
             setBoundSteps(bound);
             setStepStates(bound.map(() => ({ status: 'pending' })));
+
             for (let i = 0; i < bound.length; i++) {
                 const r = await runStep(bound[i], i);
-                setStepStates((prev) => {
-                    const next = [...prev];
-                    if (r.ok) {
+                if (r.ok) {
+                    setStepStates((prev) => {
+                        const next = [...prev];
                         next[i] = { status: 'done', result: r.result as Record<string, unknown> };
-                    } else if (r.error === 'Denied by user') {
+                        return next;
+                    });
+                } else if (r.error === 'Denied by user') {
+                    setStepStates((prev) => {
+                        const next = [...prev];
                         next[i] = { status: 'denied', error: r.error };
-                    } else {
+                        return next;
+                    });
+                    break;
+                } else {
+                    // Step failed — pause for human recovery instead of aborting.
+                    setStepStates((prev) => {
+                        const next = [...prev];
                         next[i] = { status: 'error', error: r.error };
-                    }
-                    return next;
-                });
-                if (!r.ok) break;
+                        return next;
+                    });
+                    const shouldSkip = await waitForHuman(
+                        `Step ${i + 1} failed: ${r.error ?? 'unknown error'}. Fix it in the browser window (e.g. log in, solve CAPTCHA), then click "Resume from next step" — or click "Stop" to abort.`,
+                        'error-recovery',
+                    );
+                    if (!shouldSkip) break; // Stop clicked
+                    // Mark the failed step as skipped and continue from i+1.
+                    setStepStates((prev) => {
+                        const next = [...prev];
+                        next[i] = { status: 'skipped', error: r.error };
+                        return next;
+                    });
+                }
             }
         } catch (e) {
             setError(String(e));
         } finally {
             setRunning(false);
+            window.dispatchEvent(new CustomEvent('workflow-replay-stopped'));
         }
-    }, [workflow, params, slug, runStep]);
+    }, [workflow, params, slug, runStep, waitForHuman]);
 
     return (
         <Dialog open={true} onOpenChange={(_, data) => { if (!data.open) onClose(); }} modalType="modal">
@@ -302,8 +384,20 @@ export function WorkflowReplayDialog({ slug, name, onClose }: Props) {
                                         ))}
                                     </div>
                                 )}
-                                <Text weight="semibold">Steps ({workflow.steps.length})</Text>
-                                <div className={styles.stepList} style={{ marginTop: 6 }}>
+                                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                                    <Text weight="semibold">Steps ({workflow.steps.length})</Text>
+                                    {running && !humanMode && (
+                                        <Button
+                                            size="small"
+                                            appearance="subtle"
+                                            icon={<Person16Regular />}
+                                            onClick={handleTakeOver}
+                                        >
+                                            Take over
+                                        </Button>
+                                    )}
+                                </div>
+                                <div className={styles.stepList}>
                                     {(boundSteps.length ? boundSteps : workflow.steps).map((step, i) => {
                                         const state = stepStates[i] ?? { status: 'pending' as const };
                                         return (
@@ -317,9 +411,14 @@ export function WorkflowReplayDialog({ slug, name, onClose }: Props) {
                                                         {step.params.action ? ` (${step.params.action})` : ''}
                                                     </Text>
                                                     <span className={styles.classification}>{step.classification}</span>
-                                                    {state.error && (
+                                                    {state.status === 'error' && state.error && (
                                                         <Text size={200} style={{ color: tokens.colorPaletteRedForeground1 }}>
                                                             {state.error}
+                                                        </Text>
+                                                    )}
+                                                    {state.status === 'skipped' && (
+                                                        <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
+                                                            Skipped (fixed manually)
                                                         </Text>
                                                     )}
                                                 </div>
@@ -327,8 +426,26 @@ export function WorkflowReplayDialog({ slug, name, onClose }: Props) {
                                         );
                                     })}
                                 </div>
+
+                                {/* Human takeover / error recovery card */}
+                                {humanMode && (
+                                    <div className={humanMode === 'error-recovery' ? styles.errorCard : styles.humanCard}>
+                                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+                                            <Person16Regular style={{ flexShrink: 0, marginTop: 2 }} />
+                                            <Text size={200} style={{ flex: 1 }}>{humanMessage}</Text>
+                                        </div>
+                                        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 10 }}>
+                                            <Button size="small" onClick={() => handleResume(false)}>Stop</Button>
+                                            <Button size="small" appearance="primary" onClick={() => handleResume(true)}>
+                                                {humanMode === 'error-recovery' ? 'Resume from next step' : 'Resume'}
+                                            </Button>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Write/destructive step approval card */}
                                 {pendingApproval && (
-                                    <div className={styles.approvalCard}>
+                                    <div className={styles.actionCard}>
                                         <Text weight="semibold">
                                             Confirm step {pendingApproval.stepIndex + 1} — {pendingApproval.risk}
                                         </Text>

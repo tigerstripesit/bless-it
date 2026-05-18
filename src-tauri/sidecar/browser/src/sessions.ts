@@ -149,18 +149,53 @@ async function startScreencast(page: Page, sessionId: string): Promise<CDPSessio
     }
 }
 
+/** Evict a session from the map without attempting to close the browser
+ *  (used from close-event listeners where the browser is already gone). */
+function evictSession(sessionId: string, ref: SessionRef): void {
+    if (sessions.get(sessionId) === ref) {
+        sessions.delete(sessionId);
+        log.warn('session evicted (browser/page closed externally)', { sessionId });
+    }
+}
+
+/** Wire up page-close and browser-disconnect listeners so stale sessions are
+ *  removed from the map automatically rather than silently accumulating. */
+function watchSession(ref: SessionRef): void {
+    ref.page.once('close', () => evictSession(ref.sessionId, ref));
+    // For real Browser objects (ephemeral), listen for disconnects.
+    if (typeof (ref.browser as any).on === 'function') {
+        ref.browser.on('disconnected', () => evictSession(ref.sessionId, ref));
+    }
+}
+
 export async function getOrOpenSession(opts: OpenOptions): Promise<SessionRef> {
     // Verify Chromium is installed before attempting to launch.
     ensureChromiumInstalled();
 
     const existing = sessions.get(opts.sessionId);
     if (existing) {
-        // Transparent headed upgrade: agent detected human interaction needed
-        // and re-called browser_open with headed:true. Promote without losing state.
-        if (opts.headed && !existing.headed) {
-            return promoteToHeaded(existing);
+        // Validate the session is still usable — the page or browser may have
+        // been closed externally (user closed the window, crash, previous
+        // navigation error). Returning a stale ref causes the next RPC to
+        // throw "Target page, context or browser has been closed".
+        // browser.isConnected() exists on real Browser objects but not on the
+        // persistent-context shim `{ close }`. Guard with typeof so replay of
+        // persistent-profile workflows doesn't crash.
+        const stale = existing.page.isClosed() ||
+            (typeof (existing.browser as any).isConnected === 'function' && !existing.browser.isConnected());
+        if (stale) {
+            log.warn('stale session detected, evicting and reopening', { sessionId: opts.sessionId });
+            sessions.delete(opts.sessionId);
+            await existing.browser.close().catch(() => {});
+            // Fall through to create a fresh session below.
+        } else {
+            // Transparent headed upgrade: agent detected human interaction needed
+            // and re-called browser_open with headed:true. Promote without losing state.
+            if (opts.headed && !existing.headed) {
+                return promoteToHeaded(existing);
+            }
+            return existing;
         }
-        return existing;
     }
 
     const viewport = opts.viewport ?? DEFAULT_VIEWPORT;
@@ -190,6 +225,9 @@ export async function getOrOpenSession(opts: OpenOptions): Promise<SessionRef> {
             lastObservation: null, cdp, headed, profile,
         };
         sessions.set(opts.sessionId, ref);
+        // For persistent contexts the browser shim has no real event emitter;
+        // watch the context close event instead.
+        context.once('close', () => evictSession(opts.sessionId, ref));
         log.info('session opened (persistent)', { sessionId: opts.sessionId, headed });
         return ref;
     }
@@ -209,6 +247,7 @@ export async function getOrOpenSession(opts: OpenOptions): Promise<SessionRef> {
         lastObservation: null, cdp, headed, profile,
     };
     sessions.set(opts.sessionId, ref);
+    watchSession(ref);
     log.info('session opened (ephemeral)', { sessionId: opts.sessionId, headed });
     return ref;
 }

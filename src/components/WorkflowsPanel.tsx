@@ -137,6 +137,7 @@ export function WorkflowsPanel() {
         try {
             await invoke('workflow_recording_start', { name: trimmed, modelUsed: null });
             setName('');
+            window.dispatchEvent(new CustomEvent('workflow-recording-started'));
             await refresh();
         } catch (e) {
             setError(String(e));
@@ -150,6 +151,7 @@ export function WorkflowsPanel() {
         setError(null);
         try {
             await invoke('workflow_recording_stop');
+            window.dispatchEvent(new CustomEvent('workflow-recording-stopped'));
             await refresh();
         } catch (e) {
             setError(String(e));

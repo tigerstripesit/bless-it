@@ -50,17 +50,14 @@ import {
     SparkleRegular,
     BroomRegular,
     WarningRegular,
-    BoxToolboxRegular,
 } from '@fluentui/react-icons';
 import { DiskUsageChart } from './DiskUsageChart';
 import { BreadcrumbPath } from './BreadcrumbPath';
 import { CleanerPanel } from './CleanerPanel';
-import ToolshedPanel from './ToolshedPanel';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { FileNode } from '@/types';
 import { FileMetadata } from '@/types/ai-types';
-import { ThemeToggle } from './ThemeToggle';
 import { onAgentAction } from '@/lib/agent/action-bus';
 
 const useStyles = makeStyles({
@@ -285,16 +282,11 @@ const ScanProgressBanner = ({ progress, onCancel, speed }: {
 };
 
 interface FileExplorerProps {
-    onToggleAI?: () => void;
-    isAIPanelOpen?: boolean;
     onContextChange?: (path: string, selectedItems: string[], visibleFiles?: FileMetadata[]) => void;
-    /** Called when user clicks "Ask Agent" from the file explorer with
-     *  selected items. The parent can open the AI panel and send a message
-     *  with the selected paths as context. */
     onAskAgent?: (selectedPaths: string[], currentPath: string) => void;
 }
 
-export const FileExplorer = ({ onToggleAI, isAIPanelOpen, onContextChange, onAskAgent }: FileExplorerProps) => {
+export const FileExplorer = ({ onContextChange, onAskAgent }: FileExplorerProps) => {
     const styles = useStyles();
     const [state, setState] = React.useState<ExplorerState>({
         path: 'C:\\',
@@ -307,7 +299,7 @@ export const FileExplorer = ({ onToggleAI, isAIPanelOpen, onContextChange, onAsk
 
     const [selectedItems, setSelectedItems] = React.useState<Set<SelectionItemId>>(new Set());
     const [showChart, setShowChart] = React.useState(false);
-    const [viewMode, setViewMode] = React.useState<'explorer' | 'cleaner' | 'toolshed'>('explorer');
+    const [viewMode, setViewMode] = React.useState<'explorer' | 'cleaner'>('explorer');
 
     // Scan Progress State
     const [scanProgress, setScanProgress] = useState<ScanProgressPayload | null>(null);
@@ -675,25 +667,6 @@ export const FileExplorer = ({ onToggleAI, isAIPanelOpen, onContextChange, onAsk
                     />
                 </Tooltip>
 
-                <Tooltip content="Toolshed" relationship="label">
-                    <Button
-                        icon={<BoxToolboxRegular />}
-                        appearance={viewMode === 'toolshed' ? "primary" : "secondary"}
-                        onClick={() => setViewMode(viewMode === 'toolshed' ? 'explorer' : 'toolshed')}
-                    />
-                </Tooltip>
-
-                <Tooltip content="Toggle AI Assistant" relationship="label">
-                    <Button
-                        icon={<SparkleRegular />}
-                        appearance={isAIPanelOpen ? "primary" : "secondary"}
-                        onClick={onToggleAI}
-                        disabled={!onToggleAI}
-                    />
-                </Tooltip>
-
-                <ThemeToggle />
-
                 <div className={styles.pathBar}>
                     <BreadcrumbPath
                         path={state.path}
@@ -714,13 +687,9 @@ export const FileExplorer = ({ onToggleAI, isAIPanelOpen, onContextChange, onAsk
                 />
             )}
 
-            {/* Main Content Area (Grid + Chart + Toolshed) */}
+            {/* Main Content Area (Grid + Chart) */}
             <div style={{ display: 'flex', flexGrow: 1, overflow: 'hidden', gap: '10px' }}>
-                {viewMode === 'toolshed' ? (
-                    <div style={{ flexGrow: 1, height: '100%', overflow: 'hidden' }}>
-                        <ToolshedPanel />
-                    </div>
-                ) : viewMode === 'cleaner' ? (
+                {viewMode === 'cleaner' ? (
                     <div style={{ flexGrow: 1, height: '100%', overflow: 'hidden' }}>
                         <CleanerPanel />
                     </div>

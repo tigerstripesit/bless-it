@@ -17,6 +17,9 @@ export async function handleNavigate(params: NavigateParams): Promise<{
     if (!ref) {
         throw new Error(`browser.navigate: session "${params.session_id}" not open. Call browser.open first.`);
     }
+    if (ref.page.isClosed()) {
+        throw new Error(`browser.navigate: session "${params.session_id}" has a closed page — call browser.open again to reopen.`);
+    }
 
     await ref.page.goto(params.url, {
         waitUntil: params.wait_until ?? 'domcontentloaded',
