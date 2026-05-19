@@ -389,6 +389,9 @@ pub async fn run_llamacpp_inference(request: &InferenceRequest) -> Result<Infere
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
             MessageRole::System => "system",
+            // LlamaCpp uses XML-based tool calling; native tool results don't
+            // arise here, but fall back to "user" defensively.
+            MessageRole::Tool => "user",
         };
         openai_messages.push(serde_json::json!({
             "role": role,
@@ -489,6 +492,8 @@ pub async fn run_llamacpp_inference(request: &InferenceRequest) -> Result<Infere
             is_streaming: Some(false),
             error: None,
             tool_calls,
+            images: None,
+            tool_call_id: None,
         },
         is_complete: true,
         usage,

@@ -10,7 +10,6 @@ import React, { useState, useRef, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
     Button,
-    Input,
     Text,
     Spinner,
     makeStyles,
@@ -203,23 +202,67 @@ const useStyles = makeStyles({
         backgroundColor: tokens.colorNeutralBackground2,
         ...shorthands.borderTop('1px', 'solid', tokens.colorNeutralStroke1),
         display: 'flex',
+        flexDirection: 'column',
+        ...shorthands.gap('4px'),
+    },
+    inputRow: {
+        display: 'flex',
         ...shorthands.gap('8px'),
         alignItems: 'center',
     },
-    input: {
-        flex: 1,
+    prefillHint: {
+        color: tokens.colorNeutralForeground3,
+        paddingLeft: '2px',
+    },
+    inputShell: {
+        position: 'relative',
+        width: '100%',
+        height: '32px',
         backgroundColor: tokens.colorNeutralBackground1,
-        color: tokens.colorNeutralForeground1,
         ...shorthands.border('1px', 'solid', tokens.colorNeutralStroke1),
-        '&:focus': {
+        borderRadius: tokens.borderRadiusMedium,
+        overflow: 'hidden',
+        '&:focus-within': {
             ...shorthands.border('1px', 'solid', tokens.colorBrandStroke1),
         },
-        '& input': {
-            color: tokens.colorNeutralForeground1,
-            '&::placeholder': {
-                color: tokens.colorNeutralForeground3,
-            },
+    },
+    // Invisible native <input> — captures focus, caret, and keyboard events.
+    // Text color is transparent so the highlight layer renders on top.
+    nativeInput: {
+        position: 'absolute',
+        inset: 0,
+        width: '100%',
+        height: '100%',
+        padding: '0 8px',
+        margin: 0,
+        fontFamily: tokens.fontFamilyBase,
+        fontSize: tokens.fontSizeBase300,
+        background: 'transparent',
+        color: 'transparent',
+        caretColor: tokens.colorNeutralForeground1,
+        border: 'none',
+        outline: 'none',
+        '&::placeholder': {
+            color: tokens.colorNeutralForeground3,
         },
+        '&:disabled': {
+            cursor: 'not-allowed',
+        },
+    },
+    // Non-interactive overlay that renders highlighted spans over the native input.
+    highlightLayer: {
+        position: 'absolute',
+        inset: 0,
+        display: 'flex',
+        alignItems: 'center',
+        padding: '0 8px',
+        fontFamily: tokens.fontFamilyBase,
+        fontSize: tokens.fontSizeBase300,
+        color: tokens.colorNeutralForeground1,
+        whiteSpace: 'pre',
+        overflow: 'hidden',
+        pointerEvents: 'none',
+        userSelect: 'none',
     },
     timestamp: {
         fontSize: '11px',
@@ -348,7 +391,7 @@ interface AIChatProps {
      *  paste selected file paths so the user can type their intent. */
     prefillInput?: string;
     /** Callback when the user responds to an inline confirm_action card. */
-    onActionResponse?: (actionId: string, response: 'confirm' | 'dismiss') => void;
+    onActionResponse?: (actionId: string, response: 'confirm' | 'dismiss' | 'accept' | 'edit' | 'decline') => void;
 }
 
 export function AIChat({
@@ -478,6 +521,25 @@ export function AIChat({
         return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     };
 
+    // Returns the highlight-layer content: /command in brand color, args in normal color.
+    // When not in slash-command mode, the value is rendered as plain text (no coloring needed
+    // since the overlay and native input share the same foreground token).
+    const renderHighlight = (value: string): React.ReactNode => {
+        if (!slashActive) return value;
+        const trimmed = value.trimStart();
+        const leadingSpace = value.slice(0, value.length - trimmed.length);
+        const spaceIdx = trimmed.search(/\s/);
+        const command = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
+        const rest = spaceIdx === -1 ? '' : trimmed.slice(spaceIdx);
+        return (
+            <>
+                {leadingSpace}
+                <span style={{ color: tokens.colorBrandForeground1 }}>{command}</span>
+                {rest}
+            </>
+        );
+    };
+
     return (
         <div className={styles.container}>
             <div className={styles.messagesContainer}>
@@ -556,6 +618,7 @@ export function AIChat({
             </div>
 
             <div className={styles.inputContainer}>
+                <div className={styles.inputRow}>
                 <div className={styles.inputWrapper}>
                     {paletteOpen && (
                         <div className={styles.palette} role="listbox" aria-label="Skill commands">
@@ -609,15 +672,19 @@ export function AIChat({
                             )}
                         </div>
                     )}
-                    <Input
-                        className={styles.input}
-                        value={inputValue}
-                        onChange={(e) => setInputValue(e.target.value)}
-                        onKeyDown={handleKeyDown}
-                        placeholder={placeholder}
-                        disabled={isLoading}
-                        style={{ width: '100%' }}
-                    />
+                    <div className={styles.inputShell}>
+                        <div className={styles.highlightLayer} aria-hidden="true">
+                            {renderHighlight(inputValue)}
+                        </div>
+                        <input
+                            className={styles.nativeInput}
+                            value={inputValue}
+                            onChange={(e) => setInputValue(e.target.value)}
+                            onKeyDown={handleKeyDown}
+                            placeholder={placeholder}
+                            disabled={isLoading}
+                        />
+                    </div>
                 </div>
                 {isLoading && onStopGeneration ? (
                     <Button
@@ -633,6 +700,12 @@ export function AIChat({
                         onClick={handleSend}
                         disabled={!inputValue.trim() || isLoading}
                     />
+                )}
+                </div>
+                {prefillInput && inputValue === prefillInput && (
+                    <Text className={styles.prefillHint} size={100}>
+                        describe your task, or press ↵ Enter to start
+                    </Text>
                 )}
             </div>
         </div >

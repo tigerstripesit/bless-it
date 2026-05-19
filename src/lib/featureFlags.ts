@@ -31,6 +31,9 @@ interface FeatureFlagsShape {
     memoryCrossConversationSearch: boolean;
     /** Phase 5 memory: decay stale facts and annotate old summaries. */
     memoryForgetting: boolean;
+    /** Browser-use harness (M1): expose browser_open/navigate/observe/close
+     *  tools to vision-capable models, driving a Playwright sidecar. */
+    browserAgent: boolean;
 }
 
 const DEFAULTS: FeatureFlagsShape = {
@@ -40,6 +43,7 @@ const DEFAULTS: FeatureFlagsShape = {
     memoryUserProfile: true,
     memoryCrossConversationSearch: true,
     memoryForgetting: true,
+    browserAgent: false,
 };
 
 const STORAGE_KEY = 'ittoolkit.featureFlags';

@@ -26,9 +26,72 @@ import {
     Warning20Regular,
     ErrorCircle20Regular,
     Info20Regular,
+    Sparkle24Regular,
+    Dismiss12Regular,
 } from '@fluentui/react-icons';
 import { ToolExecutionData } from '@/types/ai-types';
 import { AgentActionChip } from './AgentActionChip';
+import { WorkflowCard } from './workflow/WorkflowCard';
+
+/** Lightweight Fluent-styled table for browser_extract array results.
+ *  Picks columns from the first row's keys; renders ≤50 rows, ≤6 columns
+ *  to keep the chat bubble manageable. */
+function BrowserExtractTable({ rows }: { rows: Array<Record<string, unknown>> }) {
+    if (rows.length === 0) return null;
+    const columns = Object.keys(rows[0]).slice(0, 6);
+    const display = rows.slice(0, 50);
+    const overflow = rows.length - display.length;
+    return (
+        <div style={{ padding: '8px 12px 12px' }}>
+            <div style={{
+                overflowX: 'auto',
+                border: `1px solid ${tokens.colorNeutralStroke2}`,
+                borderRadius: 4,
+            }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                    <thead>
+                        <tr style={{ background: tokens.colorNeutralBackground3 }}>
+                            {columns.map((c) => (
+                                <th key={c} style={{
+                                    textAlign: 'left',
+                                    padding: '6px 8px',
+                                    borderBottom: `1px solid ${tokens.colorNeutralStroke2}`,
+                                    fontWeight: 600,
+                                }}>{c}</th>
+                            ))}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {display.map((row, i) => (
+                            <tr key={i}>
+                                {columns.map((c) => {
+                                    const v = row[c];
+                                    const text = v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v);
+                                    return (
+                                        <td key={c} style={{
+                                            padding: '6px 8px',
+                                            borderBottom: `1px solid ${tokens.colorNeutralStroke2}`,
+                                            verticalAlign: 'top',
+                                            maxWidth: 320,
+                                            overflow: 'hidden',
+                                            textOverflow: 'ellipsis',
+                                            whiteSpace: 'nowrap',
+                                        }}>{text}</td>
+                                    );
+                                })}
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+            {overflow > 0 && (
+                <Text size={200} style={{ color: tokens.colorNeutralForeground3, marginTop: 4, display: 'block' }}>
+                    … {overflow} more rows elided
+                </Text>
+            )}
+        </div>
+    );
+}
 
 const useStyles = makeStyles({
     container: {
@@ -181,11 +244,31 @@ const useStyles = makeStyles({
         ...shorthands.gap('8px'),
         paddingTop: '4px',
     },
+    suggestSkillCard: {
+        ...shorthands.border('1px', 'solid', tokens.colorBrandStroke1),
+        ...shorthands.borderRadius('8px'),
+        backgroundColor: tokens.colorNeutralBackground1,
+        ...shorthands.padding('12px'),
+        display: 'flex',
+        flexDirection: 'column',
+        ...shorthands.gap('10px'),
+        marginTop: '8px',
+    },
+    suggestSkillHeader: {
+        display: 'flex',
+        alignItems: 'center',
+        ...shorthands.gap('8px'),
+    },
+    suggestSkillTitle: {
+        fontSize: '14px',
+        fontWeight: 600,
+        color: tokens.colorBrandForeground1,
+    },
 });
 
 interface ToolCallDisplayProps {
     execution: ToolExecutionData;
-    onActionResponse?: (actionId: string, response: 'confirm' | 'dismiss') => void;
+    onActionResponse?: (actionId: string, response: 'confirm' | 'dismiss' | 'accept' | 'edit' | 'decline') => void;
 }
 
 function formatSize(bytes: number): string {
@@ -480,6 +563,139 @@ export function ToolCallDisplay({ execution, onActionResponse }: ToolCallDisplay
                                         onClick={() => onActionResponse?.(p.actionId, 'confirm')}
                                     >
                                         {p.severity === 'high' ? 'Proceed Anyway' : 'Execute'}
+                                    </Button>
+                                </div>
+                            </div>
+                        );
+                    })}
+
+                    {/* Browser tool inline preview (screenshot + url chip). */}
+                    {execution.actions?.map((action, idx) => {
+                        if (action.type !== 'browser_preview') return null;
+                        const p = action.payload;
+                        return (
+                            <div
+                                key={`browser-${idx}`}
+                                className={styles.section}
+                                style={{
+                                    border: `1px solid ${tokens.colorNeutralStroke2}`,
+                                    borderRadius: 8,
+                                    overflow: 'hidden',
+                                }}
+                            >
+                                <div
+                                    style={{
+                                        padding: '8px 12px',
+                                        background: tokens.colorNeutralBackground3,
+                                        display: 'flex',
+                                        flexDirection: 'column',
+                                        gap: 2,
+                                    }}
+                                >
+                                    <Text size={200} weight="semibold">
+                                        {p.kind === 'browser_observe' ? 'Browser observation' :
+                                         p.kind === 'browser_navigate' ? 'Browser navigation' :
+                                         p.kind === 'browser_open' ? 'Browser opened' :
+                                         p.kind === 'browser_close' ? 'Browser closed' :
+                                         p.kind}
+                                    </Text>
+                                    {p.url && (
+                                        <Text size={200} style={{ color: tokens.colorNeutralForeground3, wordBreak: 'break-all' }}>
+                                            {p.url}
+                                        </Text>
+                                    )}
+                                    {p.title && (
+                                        <Text size={200}>{p.title}</Text>
+                                    )}
+                                    {typeof p.nodeCount === 'number' && (
+                                        <Text size={200} style={{ color: tokens.colorNeutralForeground3 }}>
+                                            {p.nodeCount} interactive {p.nodeCount === 1 ? 'node' : 'nodes'} detected
+                                        </Text>
+                                    )}
+                                </div>
+                                {p.screenshot && (
+                                    <img
+                                        src={`data:image/jpeg;base64,${p.screenshot}`}
+                                        alt={p.title ?? 'browser screenshot'}
+                                        style={{
+                                            display: 'block',
+                                            width: '100%',
+                                            maxHeight: 400,
+                                            objectFit: 'contain',
+                                            background: tokens.colorNeutralBackground1,
+                                        }}
+                                    />
+                                )}
+                                {p.kind === 'browser_extract' && Array.isArray((p as any).data) && (p as any).data.length > 0 && (
+                                    <BrowserExtractTable rows={(p as any).data as Array<Record<string, unknown>>} />
+                                )}
+                                {p.kind === 'browser_extract' && (p as any).data && !Array.isArray((p as any).data) && (
+                                    <div className={styles.codeBlock} style={{ margin: '8px 12px' }}>
+                                        {JSON.stringify((p as any).data, null, 2)}
+                                    </div>
+                                )}
+                            </div>
+                        );
+                    })}
+
+                    {/* Workflow Card */}
+                    {execution.actions?.map((action, idx) => {
+                        if (action.type !== 'workflow_card') return null;
+                        const p = action.payload;
+                        return (
+                            <div key={`workflow-card-${idx}`} style={{ margin: '8px 0' }}>
+                                <div style={{
+                                    display: 'flex',
+                                    justifyContent: 'flex-end',
+                                    marginBottom: '4px',
+                                }}>
+                                    <Button
+                                        size="small"
+                                        appearance="subtle"
+                                        icon={<Dismiss12Regular />}
+                                        onClick={() => onActionResponse?.(p.actionId, 'dismiss')}
+                                    />
+                                </div>
+                                <WorkflowCard
+                                    workflow={p.workflow}
+                                    onAccept={() => onActionResponse?.(p.actionId, 'accept')}
+                                    onEdit={(slug) => {
+                                        window.dispatchEvent(new CustomEvent('workflow:edit', { detail: { slug } }));
+                                        onActionResponse?.(p.actionId, 'edit');
+                                    }}
+                                    onDismiss={() => onActionResponse?.(p.actionId, 'dismiss')}
+                                />
+                            </div>
+                        );
+                    })}
+
+                    {/* Suggest Skill Inline Card */}
+                    {execution.actions?.map((action, idx) => {
+                        if (action.type !== 'suggest_skill') return null;
+                        const p = action.payload;
+                        return (
+                            <div key={`suggest-skill-${idx}`} className={styles.suggestSkillCard}>
+                                <div className={styles.suggestSkillHeader}>
+                                    <Sparkle24Regular style={{ color: tokens.colorBrandForeground1, flexShrink: 0 }} />
+                                    <Text className={styles.suggestSkillTitle}>{p.title}</Text>
+                                </div>
+                                {p.description && (
+                                    <Text className={styles.cardDescription}>{p.description}</Text>
+                                )}
+                                <div className={styles.cardActions}>
+                                    <Button
+                                        appearance="subtle"
+                                        size="small"
+                                        onClick={() => onActionResponse?.(p.actionId, 'dismiss')}
+                                    >
+                                        Maybe later
+                                    </Button>
+                                    <Button
+                                        appearance="primary"
+                                        size="small"
+                                        onClick={() => onActionResponse?.(p.actionId, 'confirm')}
+                                    >
+                                        Get Started
                                     </Button>
                                 </div>
                             </div>

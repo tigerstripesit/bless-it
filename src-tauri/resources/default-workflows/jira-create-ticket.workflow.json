@@ -1,0 +1,256 @@
+{
+  "version": 2,
+  "name": "Create Jira IT Support Ticket",
+  "slug": "jira-create-ticket",
+  "description": "Creates a Jira service desk ticket via the Customer Portal. The agent navigates to the IT support portal, fills the summary and description from conversation context, and pauses for human review before submitting.",
+  "goal": "IT support ticket created in Jira with the issue details from the conversation, ticket ID reported back to the user.",
+  "createdAt": "2026-01-01T00:00:00Z",
+  "modelUsed": null,
+  "variables": [
+    {
+      "name": "jira_base_url",
+      "type": "string",
+      "source": "human_input",
+      "description": "Your Jira base URL, e.g. https://company.atlassian.net",
+      "defaultValue": ""
+    },
+    {
+      "name": "service_desk_name",
+      "type": "string",
+      "source": "human_input",
+      "description": "Name of the IT support portal as shown on the portals page, e.g. 'IT Support Service Management'",
+      "defaultValue": "IT Support Service Management"
+    },
+    {
+      "name": "request_type",
+      "type": "string",
+      "source": "human_input",
+      "description": "Request type to raise, e.g. 'Get IT help', 'Hardware request'",
+      "defaultValue": "Get IT help"
+    },
+    {
+      "name": "summary",
+      "type": "string",
+      "source": "conversation_context",
+      "description": "One-line summary of the issue (inferred from conversation)",
+      "defaultValue": ""
+    },
+    {
+      "name": "description",
+      "type": "string",
+      "source": "conversation_context",
+      "description": "Detailed description of the problem (inferred from conversation)",
+      "defaultValue": ""
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-open-jira",
+      "intent": "Open a visible persistent browser session for Jira",
+      "tool": "browser.open",
+      "params": {
+        "session_id": "jira",
+        "profile": "persistent",
+        "headed": true
+      },
+      "actor": "auto",
+      "classification": "read",
+      "retry": {
+        "maxAuto": 2,
+        "escalateTo": "human"
+      }
+    },
+    {
+      "id": "step-navigate-portals",
+      "intent": "Navigate to the Jira service desk portals listing",
+      "tool": "browser.navigate",
+      "params": {
+        "session_id": "jira",
+        "url": "{{ jira_base_url }}/servicedesk/customer/portals"
+      },
+      "actor": "auto",
+      "classification": "read",
+      "retry": {
+        "maxAuto": 2,
+        "escalateTo": "human"
+      }
+    },
+    {
+      "id": "step-login-gate",
+      "intent": "Wait for the user to sign in if Jira shows a login page",
+      "tool": "browser.observe",
+      "params": {
+        "session_id": "jira"
+      },
+      "actor": "human",
+      "humanPrompt": "The browser window is open. If Jira showed a login or SSO page, sign in now. Once you can see the IT support portals list, click Continue.",
+      "humanInputs": [],
+      "classification": "read",
+      "retry": {
+        "maxAuto": 0,
+        "escalateTo": "human"
+      }
+    },
+    {
+      "id": "step-navigate-portals-after-login",
+      "intent": "Re-navigate to portals after login to ensure we are on the right page",
+      "tool": "browser.navigate",
+      "params": {
+        "session_id": "jira",
+        "url": "{{ jira_base_url }}/servicedesk/customer/portals"
+      },
+      "actor": "auto",
+      "classification": "read",
+      "retry": {
+        "maxAuto": 2,
+        "escalateTo": "human"
+      },
+      "postcondition": {
+        "type": "url_pattern",
+        "value": "/servicedesk/customer/",
+        "timeoutMs": 20000
+      }
+    },
+    {
+      "id": "step-open-service-desk",
+      "intent": "Click the IT support service desk portal from the portals listing",
+      "tool": "browser.act",
+      "params": {
+        "session_id": "jira",
+        "action": "click",
+        "index": 0
+      },
+      "actor": "agent",
+      "classification": "read",
+      "retry": {
+        "maxAuto": 2,
+        "escalateTo": "agent",
+        "agentHint": "Find and click the link with name matching '{{ service_desk_name }}'. Do NOT click elements named 'Skip to:' or 'Skip to Main Content' — these are off-screen accessibility elements that will time out."
+      },
+      "postcondition": {
+        "type": "url_pattern",
+        "value": "/servicedesk/customer/portal/",
+        "timeoutMs": 10000
+      }
+    },
+    {
+      "id": "step-open-request-form",
+      "intent": "Navigate to the request type form for raising an IT ticket",
+      "tool": "browser.act",
+      "params": {
+        "session_id": "jira",
+        "action": "click",
+        "index": 0
+      },
+      "actor": "agent",
+      "classification": "read",
+      "retry": {
+        "maxAuto": 2,
+        "escalateTo": "agent",
+        "agentHint": "First look for a 'Common Requests' group link and click it to expand the category. Then find and click the link with name matching '{{ request_type }}'. Do NOT click 'Skip to:' or 'Skip to Main Content' elements. After clicking, the URL should contain '/create/'."
+      },
+      "postcondition": {
+        "type": "url_pattern",
+        "value": "/create/",
+        "timeoutMs": 10000
+      }
+    },
+    {
+      "id": "step-fill-summary",
+      "intent": "Fill the issue summary with the problem description from context",
+      "tool": "browser.act",
+      "params": {
+        "session_id": "jira",
+        "action": "type",
+        "index": 0,
+        "text": "{{ summary }}"
+      },
+      "actor": "agent",
+      "classification": "write",
+      "requiresVariables": ["summary"],
+      "retry": {
+        "maxAuto": 2,
+        "escalateTo": "agent",
+        "agentHint": "Find the 'Summary' text input (role=textbox, name contains 'Summary'). It is usually the first text field in the form. Use browser_observe to find its index, then type."
+      }
+    },
+    {
+      "id": "step-fill-description",
+      "intent": "Fill the description with the full issue details",
+      "tool": "browser.act",
+      "params": {
+        "session_id": "jira",
+        "action": "type",
+        "index": 0,
+        "text": "{{ description }}"
+      },
+      "actor": "agent",
+      "classification": "write",
+      "requiresVariables": ["description"],
+      "retry": {
+        "maxAuto": 2,
+        "escalateTo": "agent",
+        "agentHint": "The description editor is a ProseMirror contenteditable — you must click it first to focus it, then type. Step 1: browser_observe to find the Description field (role=textbox or generic, below Summary). Step 2: browser_act click on that index. Step 3: browser_act type with the description text. Skipping the click step will fail."
+      }
+    },
+    {
+      "id": "step-human-review",
+      "intent": "Human reviews the ticket before submission",
+      "tool": "browser.observe",
+      "params": {
+        "session_id": "jira"
+      },
+      "actor": "human",
+      "humanPrompt": "Please review the ticket details in the browser. The Summary and Description have been filled from your conversation. You can edit fields directly in the browser, then click Continue to submit.",
+      "humanInputs": [],
+      "classification": "read",
+      "retry": {
+        "maxAuto": 0,
+        "escalateTo": "human"
+      }
+    },
+    {
+      "id": "step-submit",
+      "intent": "Submit the ticket by clicking the Send / Submit button",
+      "tool": "browser.act",
+      "params": {
+        "session_id": "jira",
+        "action": "click",
+        "index": 0,
+        "submit": true
+      },
+      "actor": "agent",
+      "classification": "write",
+      "retry": {
+        "maxAuto": 2,
+        "escalateTo": "human",
+        "agentHint": "Find the primary submit button — typically labelled 'Send', 'Create', or 'Submit'. It is usually at the bottom of the form. Do NOT click 'Skip to:' or 'Skip to Main Content'."
+      },
+      "postcondition": {
+        "type": "url_pattern",
+        "value": "/servicedesk/customer/portal/",
+        "timeoutMs": 15000
+      }
+    },
+    {
+      "id": "step-extract-ticket-id",
+      "intent": "Extract the created ticket ID from the page title or URL",
+      "tool": "browser.observe",
+      "params": {
+        "session_id": "jira"
+      },
+      "actor": "auto",
+      "classification": "read",
+      "producesVariable": "ticket_id",
+      "producesFrom": {
+        "from": "url_regex",
+        "pattern": "/requests/([A-Z]+-[0-9]+)",
+        "group": 1
+      },
+      "retry": {
+        "maxAuto": 2,
+        "escalateTo": "agent"
+      }
+    }
+  ]
+}

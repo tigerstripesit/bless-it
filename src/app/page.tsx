@@ -1,10 +1,18 @@
 'use client';
 
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { FileSystemContext, FileMetadata } from '@/types/ai-types';
 import { FileExplorer } from '@/components/FileExplorer';
 import { AIPanel } from '@/components/AIPanel';
-import { makeStyles, shorthands, tokens } from '@fluentui/react-components';
+import { BrowserView } from '@/components/BrowserView';
+import { WorkflowsPanel } from '@/components/WorkflowsPanel';
+import ToolshedPanel from '@/components/ToolshedPanel';
+import { ThemeToggle } from '@/components/ThemeToggle';
+import { featureFlags } from '@/lib/featureFlags';
+import { makeStyles, shorthands, tokens, Tab, TabList, Button, Tooltip, type SelectTabEvent, type SelectTabData } from '@fluentui/react-components';
+import { SparkleRegular } from '@fluentui/react-icons';
+
+type Workspace = 'files' | 'toolshed' | 'browser' | 'workflows';
 
 const useStyles = makeStyles({
   container: {
@@ -20,6 +28,29 @@ const useStyles = makeStyles({
     flex: 1,
     minWidth: 0,
     height: '100%',
+    display: 'flex',
+    flexDirection: 'column',
+  },
+  workspaceTabs: {
+    flexShrink: 0,
+    borderBottom: `1px solid ${tokens.colorNeutralStroke2}`,
+    paddingLeft: '12px',
+    paddingRight: '20px',
+    background: tokens.colorNeutralBackground1,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  globalActions: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '4px',
+    flexShrink: 0,
+  },
+  workspaceBody: {
+    flex: 1,
+    minHeight: '0px',
+    overflow: 'hidden',
   },
   aiPanelContainer: {
     height: '100%',
@@ -56,6 +87,65 @@ export default function Home() {
   // AI Context State
   const [fsContext, setFsContext] = useState<FileSystemContext | undefined>(undefined);
   const [aiPanelPrefill, setAiPanelPrefill] = useState<string>('');
+
+  const [workspace, setWorkspace] = useState<Workspace>('files');
+  const [recordingActive, setRecordingActive] = useState(false);
+  const [replayActive, setReplayActive] = useState(false);
+
+  // Auto-switch to the Browser tab when the agent opens a session or gets a frame.
+  useEffect(() => {
+    if (!featureFlags.browserAgent) return;
+    const switchToBrowser = () => {
+      setWorkspace((w) => (w !== 'workflows' ? 'browser' : w));
+    };
+    window.addEventListener('browser-session-opened', switchToBrowser);
+    window.addEventListener('browser-view-update', switchToBrowser);
+    return () => {
+      window.removeEventListener('browser-session-opened', switchToBrowser);
+      window.removeEventListener('browser-view-update', switchToBrowser);
+    };
+  }, []);
+
+  // Show browser split + open AI panel when workflow recording starts.
+  useEffect(() => {
+    if (!featureFlags.browserAgent) return;
+    const onStart = () => {
+      setRecordingActive(true);
+      setAiPanelPrefill('/workflow-creator ');
+      setIsAIPanelOpen(true);
+    };
+    const onStop = () => setRecordingActive(false);
+    window.addEventListener('workflow-recording-started', onStart);
+    window.addEventListener('workflow-recording-stopped', onStop);
+    return () => {
+      window.removeEventListener('workflow-recording-started', onStart);
+      window.removeEventListener('workflow-recording-stopped', onStop);
+    };
+  }, []);
+
+  // Show BrowserView screencast alongside the Workflows panel during replay.
+  useEffect(() => {
+    if (!featureFlags.browserAgent) return;
+    const onStart = () => setReplayActive(true);
+    const onStop = () => setReplayActive(false);
+    window.addEventListener('workflow-replay-started', onStart);
+    window.addEventListener('workflow-replay-stopped', onStop);
+    return () => {
+      window.removeEventListener('workflow-replay-started', onStart);
+      window.removeEventListener('workflow-replay-stopped', onStop);
+    };
+  }, []);
+
+  // Switch to Workflows tab when a workflow run is triggered (from Activities, agent, etc.)
+  useEffect(() => {
+    const handler = () => setWorkspace('workflows');
+    window.addEventListener('workflow:run', handler);
+    return () => window.removeEventListener('workflow:run', handler);
+  }, []);
+
+  const onWorkspaceChange = useCallback((_e: SelectTabEvent, data: SelectTabData) => {
+    setWorkspace(data.value as Workspace);
+  }, []);
 
   const startResizing = React.useCallback(() => {
     if (panelRef.current) {
@@ -121,12 +211,65 @@ export default function Home() {
   return (
     <main className={styles.container}>
       <div className={styles.explorerContainer}>
-        <FileExplorer
-          onToggleAI={toggleAIPanel}
-          isAIPanelOpen={isAIPanelOpen}
-          onContextChange={handleContextChange}
-          onAskAgent={handleAskAgent}
-        />
+        <div className={styles.workspaceTabs}>
+          <TabList
+            selectedValue={workspace}
+            onTabSelect={onWorkspaceChange}
+          >
+            <Tab value="files">Files</Tab>
+            <Tab value="toolshed">Toolshed</Tab>
+            {featureFlags.browserAgent && <Tab value="browser">Browser</Tab>}
+            {featureFlags.browserAgent && <Tab value="workflows">Workflows</Tab>}
+          </TabList>
+          <div className={styles.globalActions}>
+            <Tooltip content="Toggle AI Assistant" relationship="label">
+              <Button
+                icon={<SparkleRegular />}
+                appearance={isAIPanelOpen ? 'primary' : 'subtle'}
+                onClick={toggleAIPanel}
+              />
+            </Tooltip>
+            <ThemeToggle />
+          </div>
+        </div>
+        <div
+          className={styles.workspaceBody}
+          style={(workspace === 'workflows' && (recordingActive || replayActive)) ? { display: 'flex', flexDirection: 'row' } : undefined}
+        >
+          {workspace === 'files' && (
+            <FileExplorer
+              onContextChange={handleContextChange}
+              onAskAgent={handleAskAgent}
+            />
+          )}
+          {workspace === 'toolshed' && <ToolshedPanel />}
+          {/* WorkflowsPanel — narrows to 300 px sidebar when recording or replaying. */}
+          {workspace === 'workflows' && (
+            <div style={{
+              width: (recordingActive || replayActive) ? '300px' : '100%',
+              flexShrink: 0,
+              height: '100%',
+              overflow: 'auto',
+              borderRight: (recordingActive || replayActive) ? `1px solid ${tokens.colorNeutralStroke2}` : 'none',
+              transition: 'width 0.2s ease',
+            }}>
+              <WorkflowsPanel />
+            </div>
+          )}
+          {/* BrowserView stays mounted so its screenshot state survives tab switches.
+              Also shown as the right pane during recording and replay. */}
+          {featureFlags.browserAgent && (
+            <div style={{
+              display: (workspace === 'browser' || (workspace === 'workflows' && (recordingActive || replayActive))) ? 'block' : 'none',
+              ...(workspace === 'workflows' && (recordingActive || replayActive)
+                ? { flex: 1, minWidth: 0, height: '100%' }
+                : { width: '100%', height: '100%' }
+              ),
+            }}>
+              <BrowserView />
+            </div>
+          )}
+        </div>
       </div>
 
       {isAIPanelOpen && (

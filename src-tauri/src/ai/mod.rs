@@ -32,6 +32,7 @@ pub enum MessageRole {
     User,
     Assistant,
     System,
+    Tool,
 }
 
 /// Model configuration
@@ -84,6 +85,15 @@ pub struct ChatMessage {
     /// Tool calls in OpenAI format (for native function calling)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<OpenAIToolCall>>,
+    /// Base64-encoded JPEG screenshots attached to this message (browser-use
+    /// vision payload). Vision-capable models receive these as
+    /// content[].image_url blocks; non-vision providers drop them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<String>>,
+    /// For Tool role messages: the tool_call_id this result corresponds to.
+    /// Must match the id of the preceding assistant message's tool_call entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 /// Inference request

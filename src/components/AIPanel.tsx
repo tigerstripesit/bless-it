@@ -76,6 +76,7 @@ import {
     parseSkillInvocation,
 } from '@/lib/skills/store';
 import { logActionEvent } from '@/lib/agent/audit';
+import { useModelConfig } from '@/lib/ModelConfigContext';
 
 const useStyles = makeStyles({
     container: {
@@ -185,6 +186,7 @@ export const AIPanel = ({
     prefillInput,
 }: AIPanelProps) => {
     const styles = useStyles();
+    const { setModelConfig: setSharedModelConfig } = useModelConfig();
 
     // Agent is the only mode. Kept as a const to avoid a wide rename of "mode" call sites.
     const mode = AIMode.Agent;
@@ -236,10 +238,14 @@ export const AIPanel = ({
     // Download state
     const [downloadProgress, setDownloadProgress] = useState<{ status: string; progress: number; modelId: string } | undefined>(undefined);
 
-    // Confirmation dialog (write = destructive mutation; read = privacy-sensitive content read)
+    // Confirmation dialog: write/destructive = mutation; read = privacy-sensitive content read.
+    // For browser actions the dialog renders the intent + screenshot in place of cmd.
     const [pendingConfirmation, setPendingConfirmation] = useState<{
         cmd: string;
-        kind: 'write' | 'read';
+        kind: 'write' | 'read' | 'destructive';
+        surface?: 'shell' | 'browser';
+        intent?: string;
+        screenshotBase64?: string;
         resolve: (value: boolean) => void;
     } | null>(null);
     const rejectConfirmRef = useRef<(() => void) | null>(null);
@@ -259,6 +265,12 @@ export const AIPanel = ({
         items: string[];
     }
     const pendingActionsRef = useRef<Map<string, PendingAgentAction>>(new Map());
+
+    interface PendingSkillAction {
+        skill: string;
+        title: string;
+    }
+    const pendingSkillActionsRef = useRef<Map<string, PendingSkillAction>>(new Map());
 
     const handleDownloadModel = async (modelId: string, provider: ModelProvider) => {
         if (provider !== ModelProvider.LlamaCpp) return;
@@ -415,6 +427,27 @@ export const AIPanel = ({
                 if (modelToSelect && providerToUse) {
                     setSelectedModelId(modelToSelect.id);
                     setActiveProvider(providerToUse);
+                    // Publish a base config so WorkflowsPanel can run agent steps
+                    // even before the user sends their first chat message.
+                    const endpointKey = providerToUse === ModelProvider.OpenAICompatible
+                        ? 'defaultAIEndpoint_openaiCompatible'
+                        : 'defaultAIEndpoint_ollama';
+                    const initEndpoint = getActiveProvider()?.endpoint
+                        || localStorage.getItem(endpointKey)
+                        || modelToSelect.endpoint;
+                    const initApiKey = getActiveProvider()?.apiKey
+                        || localStorage.getItem('defaultAIKey_openaiCompatible')
+                        || undefined;
+                    const initModelId = providerToUse === ModelProvider.OpenAICompatible
+                        ? (getActiveProvider()?.modelName || localStorage.getItem('customModelName_openaiCompatible') || modelToSelect.modelId)
+                        : modelToSelect.modelId;
+                    setSharedModelConfig({
+                        ...modelToSelect,
+                        provider: providerToUse,
+                        modelId: initModelId,
+                        ...(initEndpoint ? { endpoint: initEndpoint } : {}),
+                        ...(initApiKey ? { apiKey: initApiKey } : {}),
+                    });
                 }
             } catch (error) {
                 console.error('Failed to initialize AI panel:', error);
@@ -726,8 +759,34 @@ export const AIPanel = ({
                 userVisibleContent = invocation.args
                     ? `/${invocation.name} ${invocation.args}`
                     : `/${invocation.name}`;
+
+                // Push the skill's declared browser capabilities into the
+                // Rust-side gate. When the skill omits `capabilities:`
+                // (empty list), this falls back to chat-default permissions.
+                const manifest = skillsRef.current.find((s) => s.name === invocation.name);
+                const browserPatterns = (manifest?.capabilities ?? [])
+                    .filter((c) => c.startsWith('browser:') && c !== 'browser:screenshot');
+                const allowScreenshot = (manifest?.capabilities ?? []).includes('browser:screenshot') || true;
+                try {
+                    await invoke('browser_set_capabilities', {
+                        skillId: invocation.name,
+                        patterns: browserPatterns,
+                        allowScreenshot,
+                    });
+                } catch (capErr) {
+                    console.warn('[AIPanel] Failed to set browser capabilities for skill:', capErr);
+                }
             } catch (err) {
                 console.warn('[AIPanel] Failed to load skill body:', err);
+            }
+        } else {
+            // No skill invoked — clear any prior skill-scoped capabilities so
+            // unrestricted chat doesn't accidentally inherit the last skill's
+            // narrower allowlist.
+            try {
+                await invoke('browser_clear_capabilities');
+            } catch (capErr) {
+                console.warn('[AIPanel] Failed to clear browser capabilities:', capErr);
             }
         }
 
@@ -847,6 +906,8 @@ export const AIPanel = ({
                     ...(apiKey ? { apiKey } : {}),
                 };
 
+            setSharedModelConfig(modelConfigWithEndpoint);
+
             console.log('[AIPanel] Selected model:', selectedModel?.id);
             console.log('[AIPanel] Selected model endpoint:', selectedModel?.endpoint);
             console.log('[AIPanel] endpointToUse:', endpointToUse);
@@ -951,10 +1012,14 @@ export const AIPanel = ({
                                     suggestedCommand: action.payload.suggestedCommand,
                                     suggestedWorkingDir: action.payload.suggestedWorkingDir,
                                 });
+                            } else if (action.type === 'suggest_skill') {
+                                pendingSkillActionsRef.current.set(action.payload.actionId, {
+                                    skill: action.payload.skill,
+                                    title: action.payload.title,
+                                });
                             }
                         }
                     }
-
                     // Primary match: per-call id (model can invoke the same
                     // tool multiple times in a single turn).
                     // Fallback: oldest 'executing' row for the same toolName.
@@ -1008,7 +1073,7 @@ export const AIPanel = ({
                     ));
                 },
                 isCancelled: () => confirmCancelled,
-                onConfirmExecution: async (_toolName, args, kind) => {
+                onConfirmExecution: async (_toolName, args, kind, meta) => {
                     const cmd = (args?.cmd as string) || '';
                     return new Promise<boolean>((resolve) => {
                         rejectConfirmRef.current = () => {
@@ -1016,7 +1081,14 @@ export const AIPanel = ({
                             resolve(false);
                             setPendingConfirmation(null);
                         };
-                        setPendingConfirmation({ cmd, kind, resolve });
+                        setPendingConfirmation({
+                            cmd,
+                            kind,
+                            resolve,
+                            surface: meta?.surface,
+                            intent: meta?.intent,
+                            screenshotBase64: meta?.screenshotBase64,
+                        });
                     });
                 },
                 onProgress,
@@ -1134,7 +1206,32 @@ export const AIPanel = ({
         }
     };
 
-    const handleToolActionResponse = useCallback(async (actionId: string, response: 'confirm' | 'dismiss') => {
+    const handleToolActionResponse = useCallback(async (actionId: string, response: 'confirm' | 'dismiss' | 'accept' | 'edit' | 'decline') => {
+        // Check suggest_skill registry first — different handling path from confirm_action.
+        const pendingSkill = pendingSkillActionsRef.current.get(actionId);
+        if (pendingSkill) {
+            pendingSkillActionsRef.current.delete(actionId);
+            if (response === 'dismiss') {
+                handleSendMessage(`[user dismissed the "${pendingSkill.title}" suggestion — acknowledged, continuing]`);
+                return;
+            }
+            // Confirm: inject skill body as a system message then trigger elicitation.
+            try {
+                const body = await invoke<string | null>('get_skill_body', { name: pendingSkill.skill });
+                const systemMsg: ChatMessage = {
+                    id: `skill-${pendingSkill.skill}-${Date.now()}`,
+                    role: MessageRole.System,
+                    content: `# Skill invoked: /${pendingSkill.skill}\n\n${body ?? ''}`,
+                    timestamp: Date.now(),
+                };
+                setMessages((prev) => [...prev, systemMsg]);
+            } catch (e) {
+                console.warn('[AIPanel] suggest_skill: could not load skill body', e);
+            }
+            handleSendMessage('[user clicked "Get Started" — begin the workflow elicitation immediately, starting with section 1 questions]');
+            return;
+        }
+
         const pending = pendingActionsRef.current.get(actionId);
         // Single-use; remove so a double-click can't re-run the command.
         pendingActionsRef.current.delete(actionId);
@@ -1358,21 +1455,51 @@ export const AIPanel = ({
                 />
             )}
 
-            {/* Confirmation dialog for write (destructive) or read (privacy-sensitive) commands */}
+            {/* Confirmation dialog. Shell variant shows the cmd; browser variant
+                shows intent + screenshot of the page at action time. */}
             {pendingConfirmation && (
                 <div className={styles.confirmOverlay}>
                     <div className={styles.confirmDialog}>
                         <div className={styles.confirmTitle}>
-                            {pendingConfirmation.kind === 'read'
-                                ? 'Confirm file read'
-                                : 'Confirm destructive command'}
+                            {pendingConfirmation.surface === 'browser'
+                                ? (pendingConfirmation.kind === 'destructive'
+                                    ? 'Confirm browser action (destructive)'
+                                    : 'Confirm browser action')
+                                : pendingConfirmation.kind === 'read'
+                                    ? 'Confirm file read'
+                                    : 'Confirm destructive command'}
                         </div>
                         <Text size={200} style={{ color: tokens.colorNeutralForeground2 }}>
-                            {pendingConfirmation.kind === 'read'
-                                ? 'The agent wants to read file contents into its context. Approve only if this file is safe to share with the model:'
-                                : 'The agent wants to execute a potentially destructive command:'}
+                            {pendingConfirmation.surface === 'browser'
+                                ? 'The agent wants to perform an action that mutates web state. Review the screenshot and intent before approving:'
+                                : pendingConfirmation.kind === 'read'
+                                    ? 'The agent wants to read file contents into its context. Approve only if this file is safe to share with the model:'
+                                    : 'The agent wants to execute a potentially destructive command:'}
                         </Text>
-                        <div className={styles.confirmCommand}>{pendingConfirmation.cmd}</div>
+                        {pendingConfirmation.surface === 'browser' ? (
+                            <>
+                                {pendingConfirmation.intent && (
+                                    <div className={styles.confirmCommand}>{pendingConfirmation.intent}</div>
+                                )}
+                                {pendingConfirmation.screenshotBase64 && (
+                                    <img
+                                        src={`data:image/jpeg;base64,${pendingConfirmation.screenshotBase64}`}
+                                        alt="page at action time"
+                                        style={{
+                                            display: 'block',
+                                            width: '100%',
+                                            maxHeight: 320,
+                                            objectFit: 'contain',
+                                            background: tokens.colorNeutralBackground1,
+                                            borderRadius: 6,
+                                            border: `1px solid ${tokens.colorNeutralStroke2}`,
+                                        }}
+                                    />
+                                )}
+                            </>
+                        ) : (
+                            <div className={styles.confirmCommand}>{pendingConfirmation.cmd}</div>
+                        )}
                         <div className={styles.confirmActions}>
                             <Button
                                 appearance="secondary"
@@ -1385,12 +1512,15 @@ export const AIPanel = ({
                             </Button>
                             <Button
                                 appearance="primary"
+                                style={pendingConfirmation.kind === 'destructive'
+                                    ? { backgroundColor: '#d13438', color: 'white' } as React.CSSProperties
+                                    : undefined}
                                 onClick={() => {
                                     pendingConfirmation.resolve(true);
                                     setPendingConfirmation(null);
                                 }}
                             >
-                                Confirm
+                                {pendingConfirmation.kind === 'destructive' ? 'Proceed Anyway' : 'Confirm'}
                             </Button>
                         </div>
                     </div>

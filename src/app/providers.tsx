@@ -7,6 +7,7 @@ import { FluentProvider, webDarkTheme } from '@fluentui/react-components';
 // For now, standard webDarkTheme is professional enough.
 
 import { ThemeProvider } from '../lib/ThemeContext';
+import { ModelConfigProvider } from '../lib/ModelConfigContext';
 
 export function Providers({ children }: { children: React.ReactNode }) {
     const [mounted, setMounted] = React.useState(false);
@@ -22,8 +23,10 @@ export function Providers({ children }: { children: React.ReactNode }) {
     }
 
     return (
-        <ThemeProvider>
-            {children}
-        </ThemeProvider>
+        <ModelConfigProvider>
+            <ThemeProvider>
+                {children}
+            </ThemeProvider>
+        </ModelConfigProvider>
     );
 }

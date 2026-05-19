@@ -94,6 +94,7 @@ export interface ProviderInput {
     modelName: string;
     isDefault?: boolean;
     contextWindow?: number;
+    supportsVision?: boolean;
 }
 
 export interface ValidationResult {
@@ -141,6 +142,7 @@ export function upsertSavedProvider(input: ProviderInput): SavedOpenAIProvider {
             modelName: input.modelName.trim(),
             isDefault: input.isDefault ?? all[existingIndex].isDefault,
             contextWindow: input.contextWindow ?? all[existingIndex].contextWindow,
+            supportsVision: input.supportsVision ?? all[existingIndex].supportsVision,
             updatedAt: now,
         };
         if (updated.isDefault) {
@@ -161,6 +163,7 @@ export function upsertSavedProvider(input: ProviderInput): SavedOpenAIProvider {
         modelName: input.modelName.trim(),
         isDefault: input.isDefault ?? all.length === 0,
         contextWindow: input.contextWindow,
+        supportsVision: input.supportsVision,
         createdAt: now,
         updatedAt: now,
     };

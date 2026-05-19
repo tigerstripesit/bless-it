@@ -4,6 +4,8 @@ import { runInference } from './ai-service';
 import { detectToolCall, extractToolCalls, formatToolResult, removeToolCallTags } from './tool-calling';
 import { runtimeSettings } from '@/lib/runtimeSettings';
 import { classifyShellCommand } from './shell-classify';
+import { classifyBrowserAction, describeBrowserAction, type BrowserRisk } from './browser-classify';
+import type { HttpRequestResponse } from '@/types/workflow-types';
 
 export interface ToolExecutionEvent {
     /** Unique per call within a turn. The model can invoke the same tool
@@ -21,7 +23,18 @@ export interface ToolExecutionEvent {
     actions?: ToolResultAction[];
 }
 
-export type ConfirmKind = 'write' | 'read';
+export type ConfirmKind = 'write' | 'read' | 'destructive';
+
+/** Extra context shown to the user on the approval card. Optional — shell
+ *  commands have it derived from `args.cmd`; browser actions populate
+ *  `intent` (a one-line description) and `screenshotBase64` so the user
+ *  sees what they're approving. */
+export interface ConfirmMeta {
+    intent?: string;
+    screenshotBase64?: string;
+    /** Tool family — "shell" or "browser". UIs can render different layouts. */
+    surface?: 'shell' | 'browser';
+}
 
 export interface InferenceWithToolsOptions {
     onChunk?: (chunk: string) => void;
@@ -30,7 +43,8 @@ export interface InferenceWithToolsOptions {
     onConfirmExecution?: (
         toolName: string,
         args: Record<string, unknown>,
-        kind: ConfirmKind
+        kind: ConfirmKind,
+        meta?: ConfirmMeta,
     ) => Promise<boolean>;
     isCancelled?: () => boolean;
 }
@@ -159,6 +173,12 @@ async function executeTool(
     content: string;
     isError: boolean;
     actions?: ToolResultAction[];
+    /** Base64 JPEGs to attach as image content blocks on the tool-result
+     *  message. Populated only by browser_observe today. */
+    images?: string[];
+    /** Pre-built JSON payload the chip preview renders for this tool call.
+     *  Used by browser_* so the UI can show the screenshot + page chip. */
+    preview?: Record<string, unknown>;
 }> {
     const normalized = unwrapNestedToolCall(toolCall);
     console.log('[inference-with-tools] dispatch:', {
@@ -174,14 +194,311 @@ async function executeTool(
     if (normalized.name === 'search_conversations') {
         return executeSearchConversations(normalized.arguments);
     }
+    if (normalized.name === 'web_search') {
+        return executeWebSearch(normalized.arguments);
+    }
+    if (normalized.name === 'run_workflow') {
+        return executeRunWorkflow(normalized.arguments);
+    }
+    if (normalized.name.startsWith('browser_')) {
+        return executeBrowserTool(normalized.name, normalized.arguments);
+    }
+    if (normalized.name === 'get_workflow_schema') {
+        return executeGetWorkflowSchema();
+    }
+    if (normalized.name === 'shell.exec' || normalized.name === 'shell_exec') {
+        return executeShellCommand(normalized.arguments);
+    }
+    if (normalized.name === 'http.request' || normalized.name === 'http_request') {
+        return executeHttpRequest(normalized.arguments);
+    }
+    if (normalized.name === 'workflow.run' || normalized.name === 'workflow_run') {
+        return executeRunWorkflow(normalized.arguments);
+    }
+    if (normalized.name === 'human.gate' || normalized.name === 'human_gate') {
+        return executeHumanGate(normalized.arguments);
+    }
+    if (normalized.name === 'agent.task' || normalized.name === 'agent_task') {
+        return executeAgentTask(normalized.arguments);
+    }
     if (normalized.name !== 'execute_command') {
         console.warn('[inference-with-tools] Unknown tool name:', normalized.name, 'args:', normalized.arguments);
         return {
-            content: `Unknown tool "${normalized.name}". Available tools: "execute_command" (cmd, working_dir, timeout_secs), "search_conversations" (query, limit), "agent_action" (action, paths). Use one of these exact names.`,
+            content: `Unknown tool "${normalized.name}". Available tools: "execute_command" (cmd, working_dir, timeout_secs), "shell.exec" (command), "http.request" (method, url), "workflow.run" (slug), "human.gate" (prompt), "agent.task" (instructions), "search_conversations" (query), "web_search" (query), "agent_action" (action, paths), "get_workflow_schema" (no arguments). Use one of these exact names.`,
             isError: true,
         };
     }
     return executeShellCommand(normalized.arguments);
+}
+
+const BROWSER_METHOD_MAP: Record<string, string> = {
+    browser_open: 'browser.open',
+    browser_navigate: 'browser.navigate',
+    browser_observe: 'browser.observe',
+    browser_act: 'browser.act',
+    browser_extract: 'browser.extract',
+    browser_mark: 'browser.mark',
+    browser_close: 'browser.close',
+};
+
+/** Per-session cache of the latest browser_observe AX tree. browser_act uses
+ *  it to hydrate `tags` on the params we send the sidecar (so the
+ *  authoritative Rust classifier sees the same risk picture the frontend
+ *  did). Survives across tool calls within a session. */
+const LATEST_OBSERVATIONS = new Map<string, {
+    ax: Array<{ index: number; role: string; name: string; tags?: string[] }>;
+    url?: string;
+    title?: string;
+    screenshot?: string;
+    capturedAt: number;
+}>();
+
+/** Look up the AX node referenced by `params.index` in the cached observation
+ *  for this session and merge its `tags` + `role` into the params. After this
+ *  runs, both the frontend classifier and the Rust classifier (which reads
+ *  params.tags directly) see the same risk picture for the action. */
+function hydrateBrowserActParams(params: Record<string, unknown>): void {
+    const sessionId = (params.session_id as string | undefined) ?? '';
+    const cached = LATEST_OBSERVATIONS.get(sessionId);
+    if (!cached) return;
+    const index = typeof params.index === 'number' ? params.index : -1;
+    if (index < 0 || index >= cached.ax.length) return;
+    const node = cached.ax[index];
+    if (node.tags && node.tags.length && params.tags === undefined) {
+        params.tags = [...node.tags];
+    }
+    if (node.role && params.role === undefined) {
+        params.role = node.role;
+    }
+    if (node.name && params.name === undefined) {
+        params.name = node.name;
+    }
+}
+
+interface BrowserObserveResult {
+    url?: string;
+    title?: string;
+    ax?: Array<{ index: number; role: string; name: string; value?: string }>;
+    screenshot?: string;
+}
+
+async function logBrowserAudit(event: {
+    classification: string;
+    method: string;
+    sessionId: string;
+    url?: string;
+    elementRole?: string;
+    elementName?: string;
+    outcome: 'ok' | 'error' | 'denied';
+}): Promise<void> {
+    try {
+        await invoke('log_browser_action_event', {
+            event: {
+                classification: event.classification,
+                method: event.method,
+                sessionId: event.sessionId,
+                skillId: null,
+                url: event.url ?? null,
+                elementRole: event.elementRole ?? null,
+                elementName: event.elementName ?? null,
+                screenshotSha256: null,
+                approver: null,
+                outcome: event.outcome,
+            },
+        });
+    } catch (e) {
+        console.warn('[inference-with-tools] failed to log browser audit event:', e);
+    }
+}
+
+async function executeBrowserTool(
+    toolName: string,
+    args: Record<string, unknown>,
+): Promise<{
+    content: string;
+    isError: boolean;
+    images?: string[];
+    preview?: Record<string, unknown>;
+}> {
+    const method = BROWSER_METHOD_MAP[toolName];
+    if (!method) {
+        return {
+            content: `Unknown browser tool "${toolName}". Available: browser_open, browser_navigate, browser_observe, browser_close.`,
+            isError: true,
+        };
+    }
+    const sessionId = (args.session_id as string | undefined) ?? '';
+    try {
+        const result = await invoke<unknown>('browser_rpc', {
+            request: { method, params: args },
+        });
+
+        if (toolName === 'browser_observe') {
+            const obs = (result ?? {}) as BrowserObserveResult;
+            const ax = obs.ax ?? [];
+            // Cache so browser_act can hydrate `tags` + `role` on the params
+            // we send the sidecar, keeping the Rust classifier in sync with
+            // the frontend classifier's risk picture.
+            LATEST_OBSERVATIONS.set(sessionId, {
+                ax: (ax as Array<{ index: number; role: string; name: string; tags?: string[] }>),
+                url: obs.url,
+                title: obs.title,
+                screenshot: obs.screenshot,
+                capturedAt: Date.now(),
+            });
+            // Notify the main-pane BrowserView so it can update its viewport.
+            if (typeof window !== 'undefined') {
+                window.dispatchEvent(new CustomEvent('browser-view-update', {
+                    detail: {
+                        sessionId,
+                        url: obs.url,
+                        title: obs.title,
+                        screenshot: obs.screenshot,
+                    },
+                }));
+            }
+            // The text portion of the tool result. The screenshot rides
+            // alongside as a separate image content block — see `images`.
+            const lines: string[] = [];
+            lines.push(`url: ${obs.url ?? '(unknown)'}`);
+            lines.push(`title: ${obs.title ?? '(unknown)'}`);
+            lines.push(`ax (${ax.length} interactive nodes):`);
+            for (const n of ax.slice(0, 80)) {
+                const parts = [`  [${n.index}] role=${n.role}`];
+                if (n.name) parts.push(`name="${n.name}"`);
+                if (n.value) parts.push(`value="${n.value}"`);
+                lines.push(parts.join(' '));
+            }
+            if (ax.length > 80) {
+                lines.push(`  … ${ax.length - 80} more nodes elided. Use max_elements to expand.`);
+            }
+            const content = lines.join('\n');
+            await logBrowserAudit({
+                classification: 'read',
+                method,
+                sessionId,
+                url: obs.url,
+                outcome: 'ok',
+            });
+            return {
+                content,
+                isError: false,
+                images: obs.screenshot ? [obs.screenshot] : undefined,
+                preview: {
+                    kind: 'browser_observe',
+                    url: obs.url,
+                    title: obs.title,
+                    nodeCount: ax.length,
+                    hasScreenshot: !!obs.screenshot,
+                    // In-flight screenshot for the inline chat preview. Not
+                    // persisted; the retention layer strips this when the
+                    // ToolExecutionData is written to disk.
+                    screenshot: obs.screenshot,
+                    sessionId,
+                },
+            };
+        }
+
+        // Per-tool result shaping + audit classification.
+        let summary: string;
+        let classification: string = 'read';
+        let elementRole: string | undefined;
+        let elementName: string | undefined;
+
+        if (toolName === 'browser_navigate') {
+            const r = result as any;
+            summary = `Navigated to ${r?.url ?? args.url} — ${r?.title ?? ''}`;
+            if (r?.site_profile) summary += `\nSite profile matched: ${r.site_profile}`;
+
+            // Inject site-specific behavioral knowledge from the skill file.
+            // This gives the model immediate guidance on how to interact with the
+            // site (ARIA patterns, multi-step flows, known gotchas) without the
+            // agent needing to discover them by trial and error.
+            try {
+                const landedUrl = String(r?.url ?? args.url ?? '');
+                const hostname = landedUrl ? new URL(landedUrl).hostname : '';
+                if (hostname) {
+                    const siteKnowledge = await invoke<string | null>('get_site_skill_body', { hostname });
+                    if (siteKnowledge) {
+                        summary += `\n\n<site-knowledge host="${hostname}">\n${siteKnowledge}\n</site-knowledge>`;
+                    }
+                }
+            } catch {
+                // Unknown URL format or no skill file — operate generically.
+            }
+
+            // URL scheme determines classification — already gated upstream
+            // but we record it accurately here.
+            const url = String(args.url ?? '');
+            classification = /^(mailto:|tel:|file:|javascript:)/i.test(url) ? 'destructive' : 'read';
+        } else if (toolName === 'browser_act') {
+            const r = result as any;
+            const action = String(args.action ?? '');
+            const tags = (args.tags as string[] | undefined) ?? r?.target_tags ?? [];
+            const isWrite = args.submit === true
+                || (action === 'type' && tags.includes('password'))
+                || (action === 'click' && tags.includes('form_submit'))
+                || (action === 'press' && tags.includes('password'));
+            classification = isWrite ? 'write' : 'read';
+            elementRole = (r?.target_role ?? args.role) as string | undefined;
+            elementName = (r?.target_name ?? args.name) as string | undefined;
+            summary = `Performed ${action}` +
+                (elementName ? ` on ${elementRole ?? ''} "${elementName}"` : '') +
+                ` (now at ${r?.url ?? '(unknown url)'}).`;
+        } else if (toolName === 'browser_open') {
+            summary = `Opened browser session "${(result as any)?.session_id ?? sessionId}".`;
+            if (typeof window !== 'undefined') {
+                window.dispatchEvent(new CustomEvent('browser-session-opened', {
+                    detail: { sessionId: (result as any)?.session_id ?? sessionId },
+                }));
+            }
+        } else if (toolName === 'browser_close') {
+            summary = `Closed browser session "${sessionId}".`;
+        } else if (toolName === 'browser_extract') {
+            const r = result as { url?: string; title?: string; data?: unknown; scope?: string };
+            const data = r?.data;
+            const rowCount = Array.isArray(data) ? data.length : (data && typeof data === 'object' ? 1 : 0);
+            // Send the structured data back to the model as compact JSON so
+            // it can quote / reason over it. The UI gets the same payload
+            // via the preview blob and renders a table.
+            const json = JSON.stringify(data, null, 2);
+            const truncatedJson = json.length > 4_000 ? json.slice(0, 4_000) + '\n… (truncated)' : json;
+            summary = `Extracted ${rowCount} ${rowCount === 1 ? 'record' : 'records'} from scope "${r?.scope ?? 'body'}" on ${r?.url ?? '(unknown url)'}:\n${truncatedJson}`;
+        } else {
+            summary = JSON.stringify(result);
+        }
+
+        await logBrowserAudit({
+            classification,
+            method,
+            sessionId,
+            url: (result as any)?.url,
+            elementRole,
+            elementName,
+            outcome: 'ok',
+        });
+
+        return {
+            content: summary,
+            isError: false,
+            preview: {
+                kind: toolName,
+                ...(typeof result === 'object' && result !== null ? result : {}),
+            },
+        };
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        await logBrowserAudit({
+            classification: 'read',
+            method,
+            sessionId,
+            outcome: 'error',
+        });
+        return {
+            content: `${toolName} failed: ${message}`,
+            isError: true,
+        };
+    }
 }
 
 /** Handle agent_action tool call: validate arguments at the LLM/UI boundary,
@@ -205,15 +522,58 @@ function executeAgentAction(
     }
 
     const rawAction = typeof args.action === 'string' ? args.action.trim() : '';
-    const ALLOWED_ACTIONS = new Set(['navigate', 'open_file', 'highlight', 'confirm_action']);
+    const ALLOWED_ACTIONS = new Set(['navigate', 'open_file', 'highlight', 'confirm_action', 'suggest_skill', 'workflow_card']);
     if (!ALLOWED_ACTIONS.has(rawAction)) {
         return {
-            content: `agent_action: invalid "action" value ${JSON.stringify(args.action)}. Must be one of: navigate, open_file, highlight, confirm_action.`,
+            content: `agent_action: invalid "action" value ${JSON.stringify(args.action)}. Must be one of: navigate, open_file, highlight, confirm_action, suggest_skill, workflow_card.`,
             isError: true,
             actions: [],
         };
     }
-    const action = rawAction as 'navigate' | 'open_file' | 'highlight' | 'confirm_action';
+    const action = rawAction as 'navigate' | 'open_file' | 'highlight' | 'confirm_action' | 'suggest_skill' | 'workflow_card';
+
+    // workflow_card — no paths required; validate and render a workflow preview.
+    if (action === 'workflow_card') {
+        const raw = args.workflow as Record<string, unknown> | undefined;
+        if (!raw || !raw.name || !raw.slug || !Array.isArray(raw.steps)) {
+            return {
+                content: 'agent_action(workflow_card): "workflow" object with "name", "slug", and "steps" (array) is required.',
+                isError: true,
+                actions: [],
+            };
+        }
+        const actionId = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        return {
+            content: `Workflow card emitted: ${String(raw.name)}`,
+            isError: false,
+            actions: [{
+                type: 'workflow_card',
+                payload: { actionId, workflow: raw as any },
+            }],
+        };
+    }
+
+    // suggest_skill — no paths required; validate skill/title/description only.
+    if (action === 'suggest_skill') {
+        const MAX_SUGGEST_CHARS = 200;
+        const skill = plainText(args.skill, MAX_SUGGEST_CHARS);
+        const title = plainText(args.title, MAX_SUGGEST_CHARS);
+        const description = plainText(args.description, MAX_SUGGEST_CHARS);
+        if (!skill || !title || !description) {
+            return {
+                content: 'agent_action(suggest_skill): "skill", "title", and "description" are required, plain text, ≤ 200 chars each.',
+                isError: true,
+                actions: [],
+            };
+        }
+        turnBudget.actionsRemaining -= 1;
+        const actionId = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        return {
+            content: `Action emitted: suggest_skill — ${skill}`,
+            isError: false,
+            actions: [{ type: 'suggest_skill', payload: { actionId, skill, title, description } }],
+        };
+    }
 
     const rawPaths = Array.isArray(args.paths) ? args.paths : [];
     const validPaths: string[] = [];
@@ -375,6 +735,18 @@ async function executeShellCommand(args: Record<string, unknown>): Promise<{
     return { content, isError };
 }
 
+async function executeGetWorkflowSchema(): Promise<{
+    content: string;
+    isError: boolean;
+}> {
+    try {
+        const schema = await invoke<unknown>('get_workflow_schema');
+        return { content: JSON.stringify(schema, null, 2), isError: false };
+    } catch (e) {
+        return { content: `get_workflow_schema failed: ${e}`, isError: true };
+    }
+}
+
 interface SearchConversationsHit {
     id: string;
     title: string;
@@ -410,6 +782,142 @@ async function executeSearchConversations(args: Record<string, unknown>): Promis
     } catch (e) {
         return { content: `search_conversations failed: ${e}`, isError: true };
     }
+}
+
+async function executeWebSearch(args: Record<string, unknown>): Promise<{
+    content: string;
+    isError: boolean;
+}> {
+    const query = ((args.query as string) ?? '').trim();
+    if (!query) {
+        return { content: 'web_search: missing required argument "query"', isError: true };
+    }
+    try {
+        const results = await invoke<Array<{ title: string; snippet: string; url: string }>>(
+            'web_search_ddg', { query }
+        );
+        if (!results || results.length === 0) {
+            return { content: `No results found for "${query}".`, isError: false };
+        }
+        const lines = results.map((r, i) =>
+            `[${i + 1}] ${r.title}\n${r.snippet}\nURL: ${r.url}`
+        );
+        return { content: lines.join('\n\n'), isError: false };
+    } catch (e) {
+        return { content: `web_search failed: ${e}`, isError: true };
+    }
+}
+
+async function executeRunWorkflow(args: Record<string, unknown>): Promise<{
+    content: string;
+    isError: boolean;
+}> {
+    const slug = (args.slug as string | undefined)?.trim();
+    const variables = (args.variables as Record<string, unknown> | undefined) ?? {};
+
+    if (!slug) {
+        return { content: 'run_workflow: required argument "slug" is missing.', isError: true };
+    }
+
+    if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('workflow:run', {
+            detail: { slug, variables },
+        }));
+    }
+
+    const varSummary = Object.keys(variables).length > 0
+        ? Object.entries(variables).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ')
+        : '(no variables)';
+
+    return {
+        content: `Workflow '${slug}' launched with variables: ${varSummary}. The workflow panel is now open — the user can monitor progress there. Inform the user that the workflow has started.`,
+        isError: false,
+    };
+}
+
+async function executeHttpRequest(args: Record<string, unknown>): Promise<{
+    content: string;
+    isError: boolean;
+}> {
+    const method = ((args.method as string) ?? '').toUpperCase().trim();
+    const url = ((args.url as string) ?? '').trim();
+    if (!method || !['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+        return { content: `http.request: invalid or missing "method". Must be GET, POST, PUT, PATCH, or DELETE.`, isError: true };
+    }
+    if (!url) {
+        return { content: `http.request: missing required argument "url".`, isError: true };
+    }
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        return { content: `http.request: "url" must start with http:// or https://`, isError: true };
+    }
+    try {
+        const headers = (args.headers as Record<string, string> | undefined);
+        const headerPairs: [string, string][] | undefined = headers
+            ? Object.entries(headers).map(([k, v]) => [k, v] as [string, string])
+            : undefined;
+        const body = args.body as Record<string, unknown> | undefined;
+        const timeoutSecs = (args.timeout_secs as number | undefined) ?? 30;
+
+        const result = await invoke<HttpRequestResponse>('workflow_http_request', {
+            method,
+            url,
+            headers: headerPairs ?? null,
+            body: body ?? null,
+            timeoutSecs,
+        });
+
+        const preview = result.body.length > 1000 ? result.body.slice(0, 1000) + '\n… (truncated)' : result.body;
+        return {
+            content: `HTTP ${result.status} ${result.statusText}\n\n${preview}`,
+            isError: result.status >= 400,
+        };
+    } catch (e) {
+        return { content: `http.request failed: ${e}`, isError: true };
+    }
+}
+
+async function executeHumanGate(args: Record<string, unknown>): Promise<{
+    content: string;
+    isError: boolean;
+    actions?: ToolResultAction[];
+}> {
+    const prompt = ((args.prompt as string) ?? '').trim();
+    if (!prompt) {
+        return { content: 'human.gate: missing required argument "prompt".', isError: true };
+    }
+    const inputs = args.inputs as Array<Record<string, unknown>> | undefined;
+    return {
+        content: `Human gate: ${prompt}`,
+        isError: false,
+        actions: [{
+            type: 'confirm_action',
+            payload: {
+                title: 'Human Task Required',
+                description: prompt,
+                items: [],
+                totalSize: 0,
+                severity: 'medium' as const,
+                actionId: `human-gate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                suggestedCommand: 'echo "[human gate acknowledged]"',
+                suggestedWorkingDir: '/',
+            },
+        }],
+    };
+}
+
+async function executeAgentTask(args: Record<string, unknown>): Promise<{
+    content: string;
+    isError: boolean;
+}> {
+    const instructions = ((args.instructions as string) ?? '').trim();
+    if (!instructions) {
+        return { content: 'agent.task: missing required argument "instructions".', isError: true };
+    }
+    const context = (args.context as string | undefined) ?? '';
+    return {
+        content: `Agent task delegated: ${instructions}${context ? `\nContext: ${context}` : ''}`,
+        isError: false,
+    };
 }
 
 export async function runInferenceWithTools(
@@ -465,8 +973,10 @@ export async function runInferenceWithTools(
         }
 
         let toolCalls: any[] = [];
+        let isNativeFunctionCalling = false;
 
         if (response.message.toolCalls && response.message.toolCalls.length > 0) {
+            isNativeFunctionCalling = true;
             console.log(
                 '[inference-with-tools] Native toolCalls received:',
                 response.message.toolCalls.map((tc: any) => ({
@@ -541,12 +1051,53 @@ export async function runInferenceWithTools(
                     });
                 }
 
-                const cmd = (toolCall.arguments?.cmd as string) || '';
-                const confirmKind = toolCall.name === 'execute_command' ? classifyCommand(cmd) : null;
+                // Hydrate browser_act params with tags/role from the latest
+                // cached browser_observe, so classification sees the same
+                // risk picture the Rust side will. Mutates `arguments` in
+                // place — the sidecar receives the enriched payload too.
+                if (toolCall.name === 'browser_act') {
+                    hydrateBrowserActParams(toolCall.arguments);
+                }
+
+                let confirmKind: ConfirmKind | null = null;
+                let confirmMeta: ConfirmMeta | undefined;
+                if (toolCall.name === 'execute_command') {
+                    const cmd = (toolCall.arguments?.cmd as string) || '';
+                    confirmKind = classifyCommand(cmd);
+                    confirmMeta = { surface: 'shell' };
+                } else if (toolCall.name.startsWith('browser_')) {
+                    const risk = classifyBrowserAction({
+                        method: toolCall.name,
+                        params: toolCall.arguments,
+                        hints: {
+                            tags: toolCall.arguments?.tags as string[] | undefined,
+                            role: toolCall.arguments?.role as string | undefined,
+                        },
+                    });
+                    if (risk === 'write' || risk === 'destructive') {
+                        confirmKind = risk;
+                        const sessionId = (toolCall.arguments?.session_id as string | undefined) ?? '';
+                        const cached = LATEST_OBSERVATIONS.get(sessionId);
+                        const intent = describeBrowserAction(
+                            { method: toolCall.name, params: toolCall.arguments },
+                            cached?.url,
+                        );
+                        confirmMeta = {
+                            surface: 'browser',
+                            intent,
+                            screenshotBase64: cached?.screenshot,
+                        };
+                    }
+                }
                 const needsConfirm = !!(onConfirmExecution && confirmKind);
 
                 if (needsConfirm && confirmKind) {
-                    const confirmed = await onConfirmExecution!(toolCall.name, toolCall.arguments, confirmKind);
+                    const confirmed = await onConfirmExecution!(
+                        toolCall.name,
+                        toolCall.arguments,
+                        confirmKind,
+                        confirmMeta,
+                    );
                     if (isCancelled?.()) {
                         throw new Error('Inference cancelled');
                     }
@@ -569,12 +1120,20 @@ export async function runInferenceWithTools(
                             });
                         }
 
-                        toolResults.push({
-                            id: `tool-cancelled-${Date.now()}-${toolCall.id}`,
-                            role: MessageRole.User,
-                            content: formatToolResult(toolCall.name, 'Cancelled by user', false),
-                            timestamp: Date.now(),
-                        });
+                        toolResults.push(isNativeFunctionCalling
+                            ? {
+                                id: `tool-cancelled-${Date.now()}-${toolCall.id}`,
+                                role: MessageRole.Tool,
+                                content: 'Cancelled by user',
+                                timestamp: Date.now(),
+                                toolCallId: toolCall.id,
+                            }
+                            : {
+                                id: `tool-cancelled-${Date.now()}-${toolCall.id}`,
+                                role: MessageRole.User,
+                                content: formatToolResult(toolCall.name, 'Cancelled by user', false),
+                                timestamp: Date.now(),
+                            });
                         continue;
                     }
                 }
@@ -594,9 +1153,19 @@ export async function runInferenceWithTools(
                 if (result.isError) {
                     toolExecution.error = result.content;
                 }
-                if (result.actions?.length) {
-                    toolExecution.actions = result.actions;
+                // Tools may emit either structured `actions` (agent_action) or
+                // a `preview` blob (browser_*). We surface them through the
+                // same `actions` channel so existing UI consumers keep working;
+                // browser previews are tagged with a distinct action type.
+                const surfacedActions: ToolResultAction[] = [];
+                if (result.actions?.length) surfacedActions.push(...result.actions);
+                if (result.preview) {
+                    surfacedActions.push({
+                        type: 'browser_preview',
+                        payload: result.preview as Extract<ToolResultAction, { type: 'browser_preview' }>['payload'],
+                    });
                 }
+                if (surfacedActions.length) toolExecution.actions = surfacedActions;
 
                 allToolExecutions.push(toolExecution);
 
@@ -608,16 +1177,31 @@ export async function runInferenceWithTools(
                         result: result.content,
                         error: result.isError ? result.content : undefined,
                         executionTimeMs,
-                        actions: result.actions?.length ? result.actions : undefined,
+                        actions: surfacedActions.length ? surfacedActions : undefined,
                     });
                 }
 
-                const toolResultMessage: ChatMessage = {
-                    id: `tool-result-${Date.now()}-${toolCall.id}`,
-                    role: MessageRole.User,
-                    content: formatToolResult(toolCall.name, result.content, result.isError),
-                    timestamp: Date.now(),
-                };
+                // Native function calling: the API requires role="tool" with
+                // tool_call_id matching the preceding assistant tool_call id.
+                // XML-based calling: role="user" with <tool_result> wrapper so
+                // the model finds results in its context the usual way.
+                const toolResultMessage: ChatMessage = isNativeFunctionCalling
+                    ? {
+                        id: `tool-result-${Date.now()}-${toolCall.id}`,
+                        role: MessageRole.Tool,
+                        content: result.content,
+                        timestamp: Date.now(),
+                        toolCallId: toolCall.id,
+                        // OpenAI tool messages require string content — images
+                        // are delivered separately via the BrowserView screencast.
+                    }
+                    : {
+                        id: `tool-result-${Date.now()}-${toolCall.id}`,
+                        role: MessageRole.User,
+                        content: formatToolResult(toolCall.name, result.content, result.isError),
+                        timestamp: Date.now(),
+                        images: result.images,
+                    };
 
                 toolResults.push(toolResultMessage);
             } catch (error) {
@@ -629,16 +1213,24 @@ export async function runInferenceWithTools(
                 };
                 allToolExecutions.push(toolExecution);
 
-                const errorMessage: ChatMessage = {
-                    id: `tool-error-${Date.now()}-${toolCall.id}`,
-                    role: MessageRole.User,
-                    content: formatToolResult(
-                        toolCall.name,
-                        `Error: ${error instanceof Error ? error.message : String(error)}`,
-                        true
-                    ),
-                    timestamp: Date.now(),
-                };
+                const errorMessage: ChatMessage = isNativeFunctionCalling
+                    ? {
+                        id: `tool-error-${Date.now()}-${toolCall.id}`,
+                        role: MessageRole.Tool,
+                        content: `Error: ${error instanceof Error ? error.message : String(error)}`,
+                        timestamp: Date.now(),
+                        toolCallId: toolCall.id,
+                    }
+                    : {
+                        id: `tool-error-${Date.now()}-${toolCall.id}`,
+                        role: MessageRole.User,
+                        content: formatToolResult(
+                            toolCall.name,
+                            `Error: ${error instanceof Error ? error.message : String(error)}`,
+                            true
+                        ),
+                        timestamp: Date.now(),
+                    };
 
                 toolResults.push(errorMessage);
 
