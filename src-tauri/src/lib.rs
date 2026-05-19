@@ -17,7 +17,10 @@ mod browser_capability;
 mod browser_classify;
 mod browser_commands;
 mod workflow_recorder;
+mod workflow_db;
 mod web_search;
+
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -35,6 +38,14 @@ pub fn run() {
       }
       if let Err(e) = workflow_recorder::seed_default_workflows(&app.handle()) {
         log::warn!("Failed to seed default workflows: {}", e);
+      }
+      // Initialize SQLite-backed workflow run state
+      match workflow_db::WorkflowDb::new() {
+        Ok(db) => {
+          app.handle().manage(db);
+          log::info!("Initialized workflow SQLite database");
+        }
+        Err(e) => log::error!("Failed to initialize workflow database: {}", e),
       }
       Ok(())
     })

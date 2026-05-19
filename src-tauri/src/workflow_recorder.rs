@@ -23,10 +23,8 @@ use std::sync::Arc;
 use tauri::{command, AppHandle, Manager};
 use tokio::fs;
 use tokio::sync::Mutex;
-use uuid::Uuid;
 
 const WORKFLOWS_DIR: &str = ".ittoolkit/workflows";
-const WORKFLOW_RUNS_DIR: &str = ".ittoolkit/workflow-runs";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -398,49 +396,21 @@ pub async fn workflow_recording_finalize(
     Ok(definition)
 }
 
-// ── Run checkpoint commands ───────────────────────────────────────────────────
+// ── Run checkpoint commands (SQLite-backed) ─────────────────────────────────
 
-fn runs_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or_else(|| "Could not resolve home directory".to_string())?;
-    Ok(home.join(WORKFLOW_RUNS_DIR))
-}
-
-/// Create a new run record and persist it. Called at the start of every replay.
+/// Create a new run record and persist it via SQLite. Called at the start of every replay.
 #[command]
 pub async fn workflow_run_create(
     workflow_slug: String,
     resolved_vars: Value,
     step_count: usize,
+    db: tauri::State<'_, crate::workflow_db::WorkflowDb>,
 ) -> Result<WorkflowRun, String> {
-    let run = WorkflowRun {
-        run_id: Uuid::new_v4().to_string(),
-        workflow_slug,
-        started_at: Utc::now().to_rfc3339(),
-        status: "running".to_string(),
-        resolved_vars,
-        step_runs: (0..step_count)
-            .map(|i| WorkflowStepRun {
-                step_id: i.to_string(),
-                status: "pending".to_string(),
-                attempts: Vec::new(),
-                resolved_inputs: Value::Object(serde_json::Map::new()),
-                output_value: None,
-                started_at: None,
-                completed_at: None,
-            })
-            .collect(),
-        paused_at_step: None,
-        pause_reason: None,
-    };
-    let dir = runs_dir()?;
-    fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
-    let path = dir.join(format!("{}.run.json", run.run_id));
-    let serialized = serde_json::to_string_pretty(&run).map_err(|e| e.to_string())?;
-    fs::write(&path, serialized).await.map_err(|e| e.to_string())?;
-    Ok(run)
+    db.create_run(&workflow_slug, &resolved_vars, step_count)
 }
 
-/// Checkpoint one step's runtime state. Called after every step transition.
+/// Checkpoint one step's runtime state via SQLite. Called after every step transition.
+/// Uses an upsert into workflow_step_runs — O(1) instead of O(file_size).
 #[command]
 pub async fn workflow_run_checkpoint(
     run_id: String,
@@ -448,65 +418,28 @@ pub async fn workflow_run_checkpoint(
     step_run: WorkflowStepRun,
     paused_at_step: Option<usize>,
     pause_reason: Option<String>,
+    db: tauri::State<'_, crate::workflow_db::WorkflowDb>,
 ) -> Result<(), String> {
-    let dir = runs_dir()?;
-    let path = dir.join(format!("{}.run.json", run_id));
-    let body = fs::read_to_string(&path).await.map_err(|e| e.to_string())?;
-    let mut run: WorkflowRun = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    if step_index < run.step_runs.len() {
-        run.step_runs[step_index] = step_run;
-    }
-    run.paused_at_step = paused_at_step;
-    run.pause_reason = pause_reason;
-    let serialized = serde_json::to_string_pretty(&run).map_err(|e| e.to_string())?;
-    fs::write(&path, serialized).await.map_err(|e| e.to_string())?;
-    Ok(())
+    db.checkpoint_step(&run_id, step_index, &step_run, paused_at_step, pause_reason)
 }
 
-/// Mark a run as completed/failed/cancelled and persist final status.
+/// Mark a run as completed/failed/cancelled via SQLite.
 #[command]
-pub async fn workflow_run_complete(run_id: String, status: String) -> Result<(), String> {
-    let dir = runs_dir()?;
-    let path = dir.join(format!("{}.run.json", run_id));
-    if !path.exists() {
-        return Ok(());
-    }
-    let body = fs::read_to_string(&path).await.map_err(|e| e.to_string())?;
-    let mut run: WorkflowRun = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    run.status = status;
-    let serialized = serde_json::to_string_pretty(&run).map_err(|e| e.to_string())?;
-    fs::write(&path, serialized).await.map_err(|e| e.to_string())?;
-    Ok(())
+pub async fn workflow_run_complete(
+    run_id: String,
+    status: String,
+    db: tauri::State<'_, crate::workflow_db::WorkflowDb>,
+) -> Result<(), String> {
+    db.complete_run(&run_id, &status)
 }
 
-/// List all runs that are in "running" or "paused" state (incomplete).
+/// List all runs that are in "running" or "paused" state (incomplete) via SQLite.
 /// Called on app startup to surface resumable runs in the UI.
 #[command]
-pub async fn workflow_run_list_incomplete() -> Result<Vec<WorkflowRun>, String> {
-    let dir = runs_dir()?;
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    let mut read_dir = fs::read_dir(&dir).await.map_err(|e| e.to_string())?;
-    while let Some(entry) = read_dir.next_entry().await.map_err(|e| e.to_string())? {
-        let path = entry.path();
-        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let body = match fs::read_to_string(&path).await {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let Ok(run) = serde_json::from_str::<WorkflowRun>(&body) else {
-            continue;
-        };
-        if run.status == "running" || run.status == "paused" {
-            out.push(run);
-        }
-    }
-    out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-    Ok(out)
+pub async fn workflow_run_list_incomplete(
+    db: tauri::State<'_, crate::workflow_db::WorkflowDb>,
+) -> Result<Vec<WorkflowRun>, String> {
+    db.list_incomplete_runs()
 }
 
 #[command]
